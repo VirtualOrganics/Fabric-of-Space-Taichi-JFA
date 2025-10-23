@@ -1,0 +1,5 @@
+# Fabric of Space - Custom Taichi Grid
+# Dependencies for the custom spatial grid simulation
+
+taichi>=1.7.0
+numpy>=1.24.0

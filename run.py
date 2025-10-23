@@ -1,0 +1,469 @@
+"""
+Main entry point for Fabric of Space - Custom Taichi Grid.
+
+This script:
+1. Initializes Taichi and allocates fields
+2. Seeds particles with random positions and radii
+3. Performs warmup PBD passes to prevent initial stickiness
+4. Runs main loop: rebuild → count → adapt → PBD → color → render
+
+Controls:
+  - Right-click drag: Rotate camera
+  - Mouse wheel: Zoom
+  - SPACE: Pause/Resume
+  - S: Export particle data (PROOF radii are changing!)
+  - ESC: Exit
+"""
+
+import taichi as ti
+import numpy as np
+
+# Import configuration and kernels
+from config import (
+    N, DOMAIN_SIZE, R_MIN, R_MAX, GRID_RES, VIS_SCALE, FPS_TARGET,
+    PBD_BASE_PASSES, PBD_MAX_PASSES, PBD_ADAPTIVE_SCALE,
+    DEEP_OVERLAP_THRESHOLD, DEEP_OVERLAP_EXIT, FORCE_SUBSTEPS_MIN, FORCE_SUBSTEPS_MAX,
+    XSPH_ENABLED, DT, DEG_LOW, DEG_HIGH,
+    PBC_ENABLED
+)
+from grid import (
+    clear_grid, clear_all_particles, count_particles_per_cell, prefix_sum, copy_cell_pointers,
+    scatter_particles, count_neighbors, update_colors,
+    wrapP
+)
+from dynamics import (
+    project_overlaps, init_velocities, compute_max_overlap,
+    apply_repulsive_forces, integrate_velocities, apply_global_damping,
+    update_radii_xpbd, apply_xsph_smoothing
+)
+
+# ==============================================================================
+# Initialize Taichi
+# ==============================================================================
+
+ti.init(arch=ti.gpu)  # Use GPU (Metal on Mac, CUDA on NVIDIA, Vulkan otherwise)
+
+print(f"[Taichi] Initialized with backend: {ti.cfg.arch}")
+print(f"[Config] N={N}, Domain={DOMAIN_SIZE}, R=[{R_MIN}, {R_MAX}]")
+print(f"[Config] Grid: {GRID_RES}³ cells, PBD: {PBD_BASE_PASSES}-{PBD_MAX_PASSES} passes (adaptive)")
+
+# ==============================================================================
+# Allocate Taichi fields (with MAX capacity for runtime particle count changes)
+# ==============================================================================
+
+MAX_N = 50000  # Maximum number of particles (allocate for this, use active_n at runtime)
+
+# Particle data
+pos = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Positions
+rad = ti.field(dtype=ti.f32, shape=MAX_N)              # Radii
+deg = ti.field(dtype=ti.i32, shape=MAX_N)              # Degree (neighbor count)
+color = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # RGB color for rendering
+vel = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Velocities (for force fallback)
+vel_temp = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Temporary buffer for XSPH
+
+# Grid data
+cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
+cell_start = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Prefix sum (read-only)
+cell_write = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Write pointer (scatter)
+cell_indices = ti.field(dtype=ti.i32, shape=MAX_N)      # Sorted particle IDs
+
+# Phase A: Additional fields for stability
+local_max_depth = ti.field(dtype=ti.f32, shape=MAX_N)   # Per-particle max overlap (for reduction)
+
+# Runtime variable for active number of particles
+active_n = N  # Start with config default
+
+print(f"[Memory] Allocated {MAX_N} particles (max capacity), {GRID_RES**3} cells")
+print(f"[Memory] Active particles: {active_n}")
+
+# ==============================================================================
+# Initialize particle positions and radii
+# ==============================================================================
+
+@ti.kernel
+def wrap_seeded_positions(n: ti.i32):
+    """Wrap seeded positions into PBC primary cell (always-wrapped invariant)."""
+    for i in range(n):
+        pos[i] = wrapP(pos[i])
+
+def seed_particles(n):
+    """
+    Seed particles with random positions and radii.
+    
+    Args:
+        n: Number of particles to seed
+    
+    Positions: Uniform random in [-L/2, L/2)³ if PBC, else [0, DOMAIN_SIZE)³
+    Radii: Uniform random in [R_MIN, R_MAX]
+    
+    After seeding, positions are wrapped to maintain always-wrapped invariant.
+    """
+    if PBC_ENABLED:
+        # Seed in centered domain [-L/2, L/2)³ for symmetric initial condition
+        half_L = DOMAIN_SIZE * 0.5
+        pos_np = np.random.uniform(-half_L, half_L, (n, 3)).astype(np.float32)
+    else:
+        # Seed in bounded domain [0, DOMAIN_SIZE)³
+        pos_np = np.random.uniform(0, DOMAIN_SIZE, (n, 3)).astype(np.float32)
+    
+    rad_np = np.random.uniform(R_MIN, R_MAX, n).astype(np.float32)
+    
+    # Only write to the first n elements
+    for i in range(n):
+        pos[i] = pos_np[i]
+        rad[i] = rad_np[i]
+    
+    # Wrap positions (PBC-aware, maintains always-wrapped invariant)
+    wrap_seeded_positions(n)
+    
+    print(f"[Init] Seeded {n} particles")
+    if PBC_ENABLED:
+        print(f"       Position range: [{-half_L}, {half_L}] (PBC centered)")
+    else:
+        print(f"       Position range: [0, {DOMAIN_SIZE}]")
+    print(f"       Radius range: [{rad_np.min():.6f}, {rad_np.max():.6f}]")
+
+def warmup_pbd(n):
+    """
+    Run initial PBD passes to separate overlapping particles.
+    
+    Args:
+        n: Number of active particles
+    
+    Without this, the initial random configuration often has many overlaps,
+    leading to a sticky blob that's hard to separate later.
+    
+    We do 4 passes before the main loop starts.
+    """
+    print(f"[Warmup] Running {PBD_BASE_PASSES} PBD passes to separate initial overlaps...")
+    
+    for _ in range(PBD_BASE_PASSES):
+        # Rebuild grid
+        clear_grid(cell_count)
+        count_particles_per_cell(pos, cell_count, n)
+        prefix_sum(cell_count, cell_start)
+        copy_cell_pointers(cell_start, cell_write)
+        scatter_particles(pos, cell_write, cell_indices, n)
+        
+        # Project overlaps
+        project_overlaps(pos, rad, cell_start, cell_count, cell_indices, n)
+    
+    print(f"[Warmup] Complete. Particles separated.")
+
+def initialize_simulation(n):
+    """
+    Initialize or restart the simulation with n particles.
+    Clears ALL particle data first to avoid showing stale particles.
+    
+    Args:
+        n: Number of particles to initialize
+    
+    Returns:
+        n (validated and clamped to MAX_N)
+    """
+    global active_n
+    
+    # Validate and clamp n
+    n = max(100, min(n, MAX_N))  # Clamp to [100, MAX_N]
+    active_n = n
+    
+    # Clear ALL particle data (move inactive particles out of view)
+    # This prevents stale data from previous runs with more particles
+    clear_all_particles(pos, rad, vel, deg, color, MAX_N)
+    
+    # Seed only the active particles
+    seed_particles(n)
+    
+    # Initialize velocities for active particles
+    init_velocities(vel, n)
+    print("[Init] Velocities initialized to zero")
+    
+    # Warmup PBD
+    warmup_pbd(n)
+    
+    # Phase 0: PBC Self-Check (deterministic validation)
+    if PBC_ENABLED:
+        pos_np = pos.to_numpy()[:n]
+        half_L = DOMAIN_SIZE * 0.5
+        
+        # Check 1: All positions in [-L/2, L/2)
+        assert np.all(-half_L <= pos_np) and np.all(pos_np < half_L), \
+            f"PBC check failed: positions outside [-L/2, L/2). Range: [{pos_np.min()}, {pos_np.max()}]"
+        
+        # Check 2: Cross-boundary distance
+        # Find two particles near opposite sides (if any)
+        near_left = np.where(pos_np[:, 0] < -half_L + 0.01)[0]
+        near_right = np.where(pos_np[:, 0] > half_L - 0.01)[0]
+        
+        if len(near_left) > 0 and len(near_right) > 0:
+            i = near_left[0]
+            j = near_right[0]
+            raw_dist = np.linalg.norm(pos_np[i] - pos_np[j])
+            # True PBC distance should be much smaller
+            pbc_dist_approx = min(raw_dist, DOMAIN_SIZE - raw_dist)
+            print(f"[PBC Check] Cross-boundary pair: raw_dist={raw_dist:.4f}, pbc_dist≈{pbc_dist_approx:.4f}")
+        
+        print("[PBC Check] ✓ Startup self-check passed")
+    
+    return n
+
+# Initial setup
+active_n = initialize_simulation(active_n)
+
+# ==============================================================================
+# Main simulation loop
+# ==============================================================================
+
+def rebuild_grid():
+    """
+    Rebuild spatial grid for current particle positions.
+    
+    Must be called every frame after particles move or change size.
+    Uses active_n for the current number of particles.
+    """
+    clear_grid(cell_count)
+    count_particles_per_cell(pos, cell_count, active_n)
+    prefix_sum(cell_count, cell_start)
+    copy_cell_pointers(cell_start, cell_write)
+    scatter_particles(pos, cell_write, cell_indices, active_n)
+
+# Initialize GUI
+window = ti.ui.Window("Fabric of Space - Custom Grid", (1024, 768), vsync=True)
+canvas = window.get_canvas()
+scene = window.get_scene()  # FIX: Use window.get_scene() not ti.ui.Scene()
+camera = ti.ui.Camera()
+
+# Camera setup (pivot around center of domain)
+domain_center = DOMAIN_SIZE / 2.0  # Center of cubic volume
+camera.position(domain_center, domain_center, domain_center + 0.2)  # Start slightly above center
+camera.lookat(domain_center, domain_center, domain_center)  # Always look at center
+camera.up(0, 1, 0)
+
+print("\n" + "="*70)
+print("FABRIC OF SPACE - CUSTOM TAICHI GRID")
+print("="*70)
+print(f"Controls:")
+print(f"  - Right-click + drag: Rotate camera")
+print(f"  - Mouse wheel: Zoom in/out")
+print(f"  - WASD: Move camera")
+print(f"  - SPACE: Pause/Resume")
+print(f"  - S: Export particle data")
+print(f"  - ESC: Exit")
+print("="*70 + "\n")
+
+# Phase A: Telemetry state
+rescue_mode = False  # State for hysteresis
+rescue_frame_count = 0  # Telemetry
+total_rescue_substeps = 0  # Telemetry
+
+# GUI: Adjustable degree band thresholds
+gui_deg_low = DEG_LOW    # Start with config defaults
+gui_deg_high = DEG_HIGH
+show_centers_only = False  # Toggle for center-point visualization
+
+# GUI: Adjustable radius limits
+gui_r_min = R_MIN  # Minimum radius (meters)
+gui_r_max = R_MAX  # Maximum radius (meters)
+
+# GUI: Adjustable particle count
+gui_n_particles = N  # Number of particles (can be changed and restarted)
+restart_requested = False  # Flag to trigger restart
+
+# Main loop
+paused = False
+frame = 0
+
+while window.running:
+    # Handle keyboard input
+    if window.get_event(ti.ui.PRESS):
+        if window.event.key == ti.ui.SPACE:
+            paused = not paused
+            print(f"[Control] {'Paused' if paused else 'Resumed'}")
+        elif window.event.key == 's' or window.event.key == 'S':
+            # EXPORT DATA TO PROVE RADII ARE CHANGING
+            pos_np = pos.to_numpy()
+            rad_np = rad.to_numpy()
+            deg_np = deg.to_numpy()
+            
+            import csv
+            export_file = f"particle_data_frame_{frame}.csv"
+            with open(export_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ID', 'X', 'Y', 'Z', 'Radius', 'Degree'])
+                for i in range(active_n):
+                    writer.writerow([i, pos_np[i][0], pos_np[i][1], pos_np[i][2], rad_np[i], deg_np[i]])
+            
+            print(f"\n{'='*70}")
+            print(f"[EXPORT] Saved {export_file}")
+            print(f"         Frame: {frame}, N={active_n}")
+            print(f"         Radius stats: min={rad_np[:active_n].min():.6f}, mean={rad_np[:active_n].mean():.6f}, max={rad_np[:active_n].max():.6f}, std={rad_np[:active_n].std():.6f}")
+            print(f"         First 20 radii: {rad_np[:20]}")
+            print(f"         Last 20 radii:  {rad_np[active_n-20:active_n] if active_n >= 20 else rad_np[:active_n]}")
+            print(f"         PROOF: {len(np.unique(np.round(rad_np[:active_n], 6)))} UNIQUE radius values out of {active_n}")
+            print(f"{'='*70}\n")
+        elif window.event.key == ti.ui.ESCAPE:
+            print("[Control] Exiting...")
+            break
+    
+    # Check for restart request
+    if restart_requested:
+        print(f"\n[Restart] Reinitializing with {gui_n_particles} particles...")
+        active_n = initialize_simulation(gui_n_particles)
+        gui_n_particles = active_n  # Update GUI to reflect clamped value
+        restart_requested = False
+        frame = 0  # Reset frame counter
+        rescue_frame_count = 0
+        rescue_mode = False
+        print(f"[Restart] Complete. Active particles: {active_n}\n")
+    
+    if not paused:
+        # === 0. Rebuild grid (current radii) ===
+        rebuild_grid()
+        
+        # === 1. Compute max overlap depth ===
+        max_depth = compute_max_overlap(pos, rad, cell_start, cell_count, cell_indices, local_max_depth, active_n)
+        
+        # === 2. Determine adaptive PBD pass count ===
+        passes_needed = max(PBD_BASE_PASSES, 
+                            min(PBD_MAX_PASSES, 
+                                int(PBD_BASE_PASSES + PBD_ADAPTIVE_SCALE * (max_depth / (0.2 * R_MAX)))))
+        
+        # === 3. Deep overlap force fallback (DISABLED for now - Taichi compiler bug) ===
+        # TODO: Fix atomic operations in apply_repulsive_forces kernel
+        # For now, rely on adaptive PBD passes alone
+        
+        # Hysteresis logic (kept for telemetry)
+        if max_depth > DEEP_OVERLAP_THRESHOLD * R_MAX:
+            rescue_mode = True
+        elif max_depth < DEEP_OVERLAP_EXIT * R_MAX:
+            rescue_mode = False
+        
+        # DISABLED: Force rescue mode
+        # if rescue_mode:
+        #     rescue_frame_count += 1
+        #     # ... force application code ...
+        
+        # Track frames that WOULD have triggered rescue
+        if rescue_mode:
+            rescue_frame_count += 1
+        
+        # === 4. Adaptive PBD passes ===
+        for pass_idx in range(passes_needed):
+            rebuild_grid()  # Fresh neighbors each pass
+            project_overlaps(pos, rad, cell_start, cell_count, cell_indices, active_n)
+        
+        # === 5. XSPH velocity smoothing ===
+        if XSPH_ENABLED:
+            apply_xsph_smoothing(pos, vel, vel_temp, rad, cell_start, cell_count, cell_indices, active_n)
+        
+        # === 6. Global damping (prevent slow energy accumulation) ===
+        apply_global_damping(vel, active_n)
+        
+        # === 7. Count neighbors (geometric) ===
+        rebuild_grid()
+        count_neighbors(pos, rad, deg, cell_start, cell_count, cell_indices, active_n)
+        
+        # === 8. Adapt radii (XPBD, using geometric degree and runtime-adjustable limits) ===
+        update_radii_xpbd(rad, deg, active_n, DT, gui_r_min, gui_r_max)
+        
+        # === 9. Update colors (with runtime-adjustable band thresholds) ===
+        update_colors(deg, color, active_n, gui_deg_low, gui_deg_high)
+        
+        frame += 1
+        
+        # === Telemetry & Logging ===
+        if frame % 100 == 0:
+            deg_np = deg.to_numpy()[:active_n]
+            rad_np = rad.to_numpy()[:active_n]
+            
+            rescue_pct = 100.0 * rescue_frame_count / frame if frame > 0 else 0.0
+            
+            print(f"[Frame {frame:4d}] N={active_n}, Passes={passes_needed}, MaxDepth={max_depth:.6f} | " +
+                  f"Degree: mean={deg_np.mean():.2f}, min={deg_np.min()}, max={deg_np.max()} | " +
+                  f"Radius: mean={rad_np.mean():.4f}, min={rad_np.min():.4f}, max={rad_np.max():.4f} | " +
+                  f"Rescue: {rescue_pct:.1f}% (disabled)")
+    
+    # === 6. Render ===
+    camera.track_user_inputs(window, movement_speed=0.01, hold_key=ti.ui.RMB)
+    # Keep camera pivoting around domain center
+    camera.lookat(domain_center, domain_center, domain_center)
+    scene.set_camera(camera)
+    scene.ambient_light((0.8, 0.8, 0.8))
+    scene.point_light(pos=(0.5, 1.0, 0.5), color=(1, 1, 1))
+    
+    # Render particles: either as center points or full spheres with variable radii
+    if show_centers_only:
+        # Show only center points (tiny uniform radius)
+        scene.particles(pos, radius=0.0005, per_vertex_color=color)
+    else:
+        # Show full spheres with VARIABLE RADII and DEGREE COLORS
+        scene.particles(pos, radius=0.001, per_vertex_radius=rad, per_vertex_color=color)
+    
+    canvas.scene(scene)
+    
+    # === 7. GUI Control Panel ===
+    # Compute statistics for distribution (only active particles)
+    deg_np = deg.to_numpy()[:active_n]
+    rad_np = rad.to_numpy()[:active_n]
+    
+    count_red = np.sum(deg_np < gui_deg_low)
+    count_green = np.sum((deg_np >= gui_deg_low) & (deg_np <= gui_deg_high))
+    count_blue = np.sum(deg_np > gui_deg_high)
+    
+    pct_red = 100.0 * count_red / active_n
+    pct_green = 100.0 * count_green / active_n
+    pct_blue = 100.0 * count_blue / active_n
+    
+    # IMGUI window for controls and stats (expanded height for particle count control)
+    window.GUI.begin("Control Panel", 0.01, 0.01, 0.32, 0.70)
+    
+    # Particle count section
+    window.GUI.text(f"=== Particle Count ===")
+    window.GUI.text(f"Active: {active_n} / {MAX_N}")
+    gui_n_particles = window.GUI.slider_int("New N", gui_n_particles, 100, MAX_N)
+    if window.GUI.button("RESTART"):
+        restart_requested = True
+    window.GUI.text("")
+    
+    # Degree statistics section
+    window.GUI.text(f"=== Degree Stats ===")
+    window.GUI.text(f"Avg:  {deg_np.mean():.2f}")
+    window.GUI.text(f"Min:  {deg_np.min()}")
+    window.GUI.text(f"Max:  {deg_np.max()}")
+    window.GUI.text("")
+    window.GUI.text("Distribution:")
+    window.GUI.text(f"  <{gui_deg_low}: {pct_red:.1f}%")
+    window.GUI.text(f"  {gui_deg_low}-{gui_deg_high}: {pct_green:.1f}%")
+    window.GUI.text(f"  >{gui_deg_high}: {pct_blue:.1f}%")
+    window.GUI.text("")
+    window.GUI.text("Band Thresholds:")
+    gui_deg_low = window.GUI.slider_int("Min (grow below)", gui_deg_low, 1, 20)
+    gui_deg_high = window.GUI.slider_int("Max (shrink above)", gui_deg_high, 1, 30)
+    window.GUI.text("")
+    
+    # Radius limits section
+    window.GUI.text(f"=== Radius Limits ===")
+    window.GUI.text(f"Current: {rad_np.min():.5f} - {rad_np.max():.5f}")
+    gui_r_min = window.GUI.slider_float("Min radius", gui_r_min, 0.0001, 0.0100)
+    gui_r_max = window.GUI.slider_float("Max radius", gui_r_max, 0.0001, 0.0200)
+    window.GUI.text("")
+    
+    # System configuration section
+    window.GUI.text(f"=== System Config ===")
+    pbc_status = "ON" if PBC_ENABLED else "OFF"
+    window.GUI.text(f"PBC: {pbc_status} (restart to change)")
+    window.GUI.text("")
+    
+    # Visualization section
+    window.GUI.text(f"=== Visualization ===")
+    show_centers_only = window.GUI.checkbox("Show centers only", show_centers_only)
+    window.GUI.end()
+    
+    window.show()
+
+print("\n[Exit] Simulation ended.")
+print(f"       Total frames: {frame}")
+print(f"       Active particles: {active_n}")
+print(f"       Final mean degree: {deg.to_numpy()[:active_n].mean():.2f}")
+print(f"       Final mean radius: {rad.to_numpy()[:active_n].mean():.4f}")
+
