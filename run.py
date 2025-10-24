@@ -17,14 +17,27 @@ Controls:
 
 import taichi as ti
 import numpy as np
+import time  # For performance profiling
 
 # Import configuration and kernels
 from config import (
     N, DOMAIN_SIZE, R_MIN, R_MAX, GRID_RES, VIS_SCALE, FPS_TARGET,
-    PBD_BASE_PASSES, PBD_MAX_PASSES, PBD_ADAPTIVE_SCALE,
+    PBD_BASE_PASSES, PBD_MAX_PASSES, PBD_ADAPTIVE_SCALE, PBD_SUBSTEPS,
     DEEP_OVERLAP_THRESHOLD, DEEP_OVERLAP_EXIT, FORCE_SUBSTEPS_MIN, FORCE_SUBSTEPS_MAX,
+    RESCUE_ENABLED, RESCUE_STRENGTH,
     XSPH_ENABLED, DT, DEG_LOW, DEG_HIGH,
-    PBC_ENABLED
+    PBC_ENABLED,
+    GAIN_GROW, GAIN_SHRINK,
+    # Phase B: Topological neighbor counting (optional, off by default)
+    TOPO_ENABLED, TOPO_UPDATE_CADENCE, TOPO_EMA_ALPHA, TOPO_DEG_LOW, TOPO_DEG_HIGH,
+    TOPO_BLEND_FRAMES, TOPO_BLEND_LAMBDA_START, TOPO_BLEND_LAMBDA_END,
+    TOPO_TRUNCATION_WARNING_THRESHOLD,
+    TOPO_BATCHES, TOPO_PAIR_SUBSAMPLE_Q, TOPO_WRITE_TO_EMA,
+    USE_KNN_TOPO, KNN_TOPO_K,
+    # Lévy Positional Diffusion (Track 2: topological regularization)
+    LEVY_ENABLED, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC, LEVY_USE_TOPO_DEG,
+    # Growth/Relax Rhythm (defaults only; runtime uses Taichi fields)
+    GROWTH_RATE_DEFAULT, GROWTH_INTERVAL_DEFAULT, RELAX_INTERVAL_DEFAULT
 )
 from grid import (
     clear_grid, clear_all_particles, count_particles_per_cell, prefix_sum, copy_cell_pointers,
@@ -34,8 +47,13 @@ from grid import (
 from dynamics import (
     project_overlaps, init_velocities, compute_max_overlap,
     apply_repulsive_forces, integrate_velocities, apply_global_damping,
-    update_radii_xpbd, apply_xsph_smoothing
+    update_radii_xpbd, apply_xsph_smoothing,
+    init_jitter_velocities, apply_brownian, integrate_jitter,
+    compute_mean_radius, smooth_degree, levy_position_diffusion
 )
+
+# Phase B: Topological neighbor counting
+import topology
 
 # ==============================================================================
 # Initialize Taichi
@@ -57,9 +75,21 @@ MAX_N = 50000  # Maximum number of particles (allocate for this, use active_n at
 pos = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Positions
 rad = ti.field(dtype=ti.f32, shape=MAX_N)              # Radii
 deg = ti.field(dtype=ti.i32, shape=MAX_N)              # Degree (neighbor count)
+deg_smoothed = ti.field(dtype=ti.f32, shape=MAX_N)     # Smoothed degree (EMA, for Lévy diffusion)
 color = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # RGB color for rendering
 vel = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Velocities (for force fallback)
 vel_temp = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Temporary buffer for XSPH
+
+# Brownian motion (OU jitter velocities)
+v_jit = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)   # Jitter velocities (OU process)
+mean_radius = ti.field(dtype=ti.f32, shape=())           # Scalar: mean radius (for jitter scaling)
+
+# Runtime growth rhythm controls (0D Taichi fields - GUI edits these directly)
+grow_rate_rt = ti.field(dtype=ti.f32, shape=())          # Growth rate per pulse (runtime)
+grow_interval_rt = ti.field(dtype=ti.i32, shape=())      # Frames between pulses (runtime)
+relax_interval_rt = ti.field(dtype=ti.i32, shape=())     # Relax frames after pulse (runtime)
+pulse_timer = ti.field(dtype=ti.i32, shape=())           # Frames until next pulse
+relax_timer = ti.field(dtype=ti.i32, shape=())           # Frames remaining in relax window
 
 # Grid data
 cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
@@ -70,6 +100,11 @@ cell_indices = ti.field(dtype=ti.i32, shape=MAX_N)      # Sorted particle IDs
 # Phase A: Additional fields for stability
 local_max_depth = ti.field(dtype=ti.f32, shape=MAX_N)   # Per-particle max overlap (for reduction)
 
+# Phase B: Topological neighbor counting fields (optional, only if enabled)
+if TOPO_ENABLED:
+    topology.allocate_fields(MAX_N)
+    print(f"[Memory] Allocated topological fields (Phase B)")
+
 # Runtime variable for active number of particles
 active_n = N  # Start with config default
 
@@ -79,6 +114,14 @@ print(f"[Memory] Active particles: {active_n}")
 # ==============================================================================
 # Initialize particle positions and radii
 # ==============================================================================
+
+def init_rhythm_runtime():
+    """Initialize growth/relax rhythm runtime fields from config defaults."""
+    grow_rate_rt[None] = GROWTH_RATE_DEFAULT
+    grow_interval_rt[None] = GROWTH_INTERVAL_DEFAULT
+    relax_interval_rt[None] = RELAX_INTERVAL_DEFAULT
+    pulse_timer[None] = GROWTH_INTERVAL_DEFAULT  # First pulse after N frames
+    relax_timer[None] = 0
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
@@ -176,7 +219,11 @@ def initialize_simulation(n):
     
     # Initialize velocities for active particles
     init_velocities(vel, n)
+    init_jitter_velocities(v_jit, n)
     print("[Init] Velocities initialized to zero")
+    
+    # Initialize growth/relax rhythm (load defaults into runtime fields)
+    init_rhythm_runtime()
     
     # Warmup PBD
     warmup_pbd(n)
@@ -317,8 +364,14 @@ while window.running:
         print(f"[Restart] Complete. Active particles: {active_n}\n")
     
     if not paused:
+        # === PERFORMANCE PROFILING ===
+        t_start = time.perf_counter()
+        ti.sync()
+        
         # === 0. Rebuild grid (current radii) ===
         rebuild_grid()
+        ti.sync()
+        t_grid = time.perf_counter()
         
         # === 1. Compute max overlap depth ===
         max_depth = compute_max_overlap(pos, rad, cell_start, cell_count, cell_indices, local_max_depth, active_n)
@@ -328,24 +381,20 @@ while window.running:
                             min(PBD_MAX_PASSES, 
                                 int(PBD_BASE_PASSES + PBD_ADAPTIVE_SCALE * (max_depth / (0.2 * R_MAX)))))
         
-        # === 3. Deep overlap force fallback (DISABLED for now - Taichi compiler bug) ===
-        # TODO: Fix atomic operations in apply_repulsive_forces kernel
-        # For now, rely on adaptive PBD passes alone
-        
-        # Hysteresis logic (kept for telemetry)
+        # === 3. Deep overlap force fallback (Track 1: gentle rescue) ===
+        # Hysteresis logic
         if max_depth > DEEP_OVERLAP_THRESHOLD * R_MAX:
             rescue_mode = True
         elif max_depth < DEEP_OVERLAP_EXIT * R_MAX:
             rescue_mode = False
         
-        # DISABLED: Force rescue mode
-        # if rescue_mode:
-        #     rescue_frame_count += 1
-        #     # ... force application code ...
-        
-        # Track frames that WOULD have triggered rescue
-        if rescue_mode:
+        # Apply rescue forces if enabled and rescue mode is active
+        if RESCUE_ENABLED and rescue_mode:
             rescue_frame_count += 1
+            # Apply soft repulsive forces (scaled by RESCUE_STRENGTH)
+            dt_rescue = DT * RESCUE_STRENGTH
+            apply_repulsive_forces(pos, rad, vel, cell_start, cell_count, cell_indices, dt_rescue, active_n)
+            integrate_velocities(pos, vel, active_n, dt_rescue)
         
         # === 4. Adaptive PBD passes ===
         for pass_idx in range(passes_needed):
@@ -359,15 +408,132 @@ while window.running:
         # === 6. Global damping (prevent slow energy accumulation) ===
         apply_global_damping(vel, active_n)
         
-        # === 7. Count neighbors (geometric) ===
-        rebuild_grid()
-        count_neighbors(pos, rad, deg, cell_start, cell_count, cell_indices, active_n)
+        # === 6B. Brownian motion (OU jitter) - Track 1 Option B ===
+        # Compute mean radius for jitter scaling
+        rad_np = rad.to_numpy()[:active_n]
+        mean_radius[None] = rad_np.mean()
         
-        # === 8. Adapt radii (XPBD, using geometric degree and runtime-adjustable limits) ===
-        update_radii_xpbd(rad, deg, active_n, DT, gui_r_min, gui_r_max)
+        # Apply smooth Brownian drift (OU process)
+        apply_brownian(v_jit, rad, mean_radius, active_n, DT)
+        
+        # Integrate jitter into positions (PBC-safe)
+        integrate_jitter(pos, v_jit, active_n, DT)
+        
+        # === 6C. Lévy Positional Diffusion - Track 2 (Topological Regularization) ===
+        # NOTE: Lévy now runs ONLY during relax frames (see step 8 below).
+        # This section is intentionally left empty (Lévy moved to relax window).
+        
+        # === 7. Keep the grid current for this frame's geometry ===
+        rebuild_grid()
+        ti.sync()
+        t_pbd = time.perf_counter()
+        
+        # === 8. PULSE gate: measure + ONE discrete growth step, then schedule relax ===
+        if pulse_timer[None] <= 0:
+            # 8A. Measure with current geometry
+            count_neighbors(pos, rad, deg, cell_start, cell_count, cell_indices, active_n)
+            
+            # Store radius stats BEFORE pulse (for telemetry)
+            rad_np_before = rad.to_numpy()[:active_n]
+            deg_np_before = deg.to_numpy()[:active_n]
+            r_mean_before = rad_np_before.mean()
+            deg_mean_before = deg_np_before.mean()
+            
+            # 8B. One discrete growth/shrink step (±grow_rate_rt)
+            deg_low_target = TOPO_DEG_LOW if TOPO_ENABLED else gui_deg_low
+            deg_high_target = TOPO_DEG_HIGH if TOPO_ENABLED else gui_deg_high
+            
+            # Auto-enforce: rate limit >= growth rate (so pulse is visible)
+            from config import RADIUS_RATE_LIMIT
+            rate_limit_rt = max(RADIUS_RATE_LIMIT, float(grow_rate_rt[None]))
+            
+            # Apply pulse with runtime rate limit
+            update_radii_xpbd(rad, deg, active_n, DT, gui_r_min, gui_r_max, 
+                             deg_low_target, deg_high_target, 
+                             grow_rate_rt[None], grow_rate_rt[None], rate_limit_rt)
+            
+            # Store radius stats AFTER pulse (for telemetry)
+            rad_np_after = rad.to_numpy()[:active_n]
+            r_mean_after = rad_np_after.mean()
+            
+            # Count how many radii hit bounds (clipped)
+            clipped_min = np.sum(rad_np_after <= gui_r_min + 1e-6)
+            clipped_max = np.sum(rad_np_after >= gui_r_max - 1e-6)
+            clipped_total = clipped_min + clipped_max
+            clipped_pct = 100.0 * clipped_total / active_n if active_n > 0 else 0.0
+            
+            # 8C. Schedule relax window and next pulse
+            relax_timer[None] = relax_interval_rt[None]
+            pulse_timer[None] = grow_interval_rt[None]
+            
+            # 8D. Enhanced telemetry (every pulse, with before/after stats)
+            delta_r_mean = r_mean_after - r_mean_before
+            delta_r_pct = 100.0 * delta_r_mean / r_mean_before if r_mean_before > 0 else 0.0
+            
+            print(f"[Pulse] frame={frame:4d} | rate={grow_rate_rt[None]:.3f} gap={grow_interval_rt[None]} relax={relax_interval_rt[None]}")
+            print(f"        deg: μ={deg_mean_before:.2f} [{deg_np_before.min()},{deg_np_before.max()}]")
+            print(f"        r_mean: {r_mean_before:.6f} → {r_mean_after:.6f} (Δ={delta_r_mean:+.6f}, {delta_r_pct:+.2f}%)")
+            print(f"        clipped: {clipped_total}/{active_n} ({clipped_pct:.1f}%) [min={clipped_min} max={clipped_max}]")
+            print(f"        max_depth={max_depth:.6f}, passes={passes_needed}")
+        else:
+            pulse_timer[None] -= 1
+        
+        # === 9. MOTION happens every frame (PBD already done above) ===
+        
+        # === 10. LÉVY: runs ONLY during relax frames ===
+        if relax_timer[None] > 0:
+            relax_timer[None] -= 1
+            if LEVY_ENABLED:
+                # Compute mean radius for step size clamping
+                compute_mean_radius(rad, active_n, mean_radius)
+                
+                # Smooth degree values (EMA with α=0.25 for stable diffusion)
+                smooth_degree(deg, deg_smoothed, active_n, 0.25)
+                
+                # Apply Lévy diffusion (particles shift toward better-connected neighbors)
+                levy_position_diffusion(pos, deg_smoothed, cell_start, cell_count, cell_indices,
+                                       mean_radius, active_n, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC)
+        
+        # === 11. Topological neighbor counting (Phase B - OPTIONAL, OFF BY DEFAULT) ===
+        # Note: This runs independently of growth rhythm (for topology analysis only)
+        topo_did_run = False
+        if TOPO_ENABLED:
+            if frame % TOPO_UPDATE_CADENCE == 0:
+                topo_did_run = True
+                # Build candidate pairs (spatial pruning)
+                topology.build_topo_candidates(pos, rad, cell_start, cell_count, cell_indices, active_n)
+                
+                # Gabriel graph test (witness-based, with hash-based subsampling and early exit)
+                topology.gabriel_test_topological_degree(pos, rad, cell_start, cell_count, cell_indices, active_n, frame)
+            
+            # Update EMA (every frame, even if topo not recomputed)
+            topology.update_topo_ema(TOPO_EMA_ALPHA, active_n)
+            
+            # === Blend topological + geometric degrees (first 200 frames) ===
+            if frame < TOPO_BLEND_FRAMES:
+                # Linear blend from 80% topo → 100% topo
+                blend_lambda = TOPO_BLEND_LAMBDA_START + \
+                               (TOPO_BLEND_LAMBDA_END - TOPO_BLEND_LAMBDA_START) * (frame / TOPO_BLEND_FRAMES)
+                
+                # Compute blended degree
+                deg_topo_np = topology.topo_deg_ema.to_numpy()[:active_n]
+                deg_geom_np = deg.to_numpy()[:active_n]
+                deg_blended_np = blend_lambda * deg_topo_np + (1.0 - blend_lambda) * deg_geom_np
+                
+                # Write back to deg field (used by radius adaptation)
+                for i in range(active_n):
+                    deg[i] = int(deg_blended_np[i])
+            else:
+                # Pure topological (after blend period)
+                deg_topo_np = topology.topo_deg_ema.to_numpy()[:active_n]
+                for i in range(active_n):
+                    deg[i] = int(deg_topo_np[i])
         
         # === 9. Update colors (with runtime-adjustable band thresholds) ===
         update_colors(deg, color, active_n, gui_deg_low, gui_deg_high)
+        
+        ti.sync()
+        t_topo = time.perf_counter()
         
         frame += 1
         
@@ -377,11 +543,36 @@ while window.running:
             rad_np = rad.to_numpy()[:active_n]
             
             rescue_pct = 100.0 * rescue_frame_count / frame if frame > 0 else 0.0
+            rescue_status = f"{rescue_pct:.1f}%" if RESCUE_ENABLED else f"{rescue_pct:.1f}% (disabled)"
             
-            print(f"[Frame {frame:4d}] N={active_n}, Passes={passes_needed}, MaxDepth={max_depth:.6f} | " +
-                  f"Degree: mean={deg_np.mean():.2f}, min={deg_np.min()}, max={deg_np.max()} | " +
-                  f"Radius: mean={rad_np.mean():.4f}, min={rad_np.min():.4f}, max={rad_np.max():.4f} | " +
-                  f"Rescue: {rescue_pct:.1f}% (disabled)")
+            # Phase B telemetry (topological degree)
+            if TOPO_ENABLED:
+                topo_deg_np = topology.topo_deg.to_numpy()[:active_n]
+                topo_deg_ema_np = topology.topo_deg_ema.to_numpy()[:active_n]
+                topo_pair_count_np = topology.topo_pair_count.to_numpy()[:active_n]
+                topo_truncated_np = topology.topo_truncated.to_numpy()[:active_n]
+                
+                truncated_pct = 100.0 * np.sum(topo_truncated_np) / active_n if active_n > 0 else 0.0
+                
+                print(f"[Frame {frame:4d}] N={active_n}, Passes={passes_needed}, MaxDepth={max_depth:.6f}")
+                print(f"    Geom Deg: mean={deg_np.mean():.2f}, min={deg_np.min()}, max={deg_np.max()}")
+                print(f"    Topo Deg (raw): mean={topo_deg_np.mean():.2f}, min={topo_deg_np.min()}, max={topo_deg_np.max()}")
+                print(f"    Topo Deg (EMA): mean={topo_deg_ema_np.mean():.2f}, min={topo_deg_ema_np.min():.2f}, max={topo_deg_ema_np.max():.2f}")
+                print(f"    Topo Pairs: mean={topo_pair_count_np.mean():.1f}, max={topo_pair_count_np.max()}")
+                print(f"    Topo Truncated: {truncated_pct:.2f}% ({np.sum(topo_truncated_np)}/{active_n})")
+                print(f"    Radius: mean={rad_np.mean():.4f}, min={rad_np.min():.4f}, max={rad_np.max():.4f}")
+                print(f"    Rescue: {rescue_status}")
+                
+                # Warning if truncation is too high
+                if truncated_pct > TOPO_TRUNCATION_WARNING_THRESHOLD * 100:
+                    print(f"    [WARNING] Truncation >{TOPO_TRUNCATION_WARNING_THRESHOLD*100:.1f}%! " +
+                          f"Consider increasing MAX_TOPO_NEIGHBORS or reducing TOPO_MAX_RADIUS_MULTIPLE")
+            else:
+                # Track 1 (Fast Path): Geometric PCC only, simple telemetry
+                print(f"[Frame {frame:4d}] N={active_n}, Passes={passes_needed}, MaxDepth={max_depth:.6f} | " +
+                      f"Degree: mean={deg_np.mean():.2f}, min={deg_np.min()}, max={deg_np.max()} | " +
+                      f"Radius: mean={rad_np.mean():.4f}, min={rad_np.min():.4f}, max={rad_np.max():.4f} | " +
+                      f"Rescue: {rescue_status}")
     
     # === 6. Render ===
     camera.track_user_inputs(window, movement_speed=0.01, hold_key=ti.ui.RMB)
@@ -448,10 +639,30 @@ while window.running:
     gui_r_max = window.GUI.slider_float("Max radius", gui_r_max, 0.0001, 0.0200)
     window.GUI.text("")
     
+    # Growth Rhythm section (runtime controls - no snap-back!)
+    window.GUI.text(f"=== Growth Rhythm ===")
+    rate = window.GUI.slider_float("Growth rate per pulse", grow_rate_rt[None], 0.01, 0.10)
+    gap = window.GUI.slider_int("Frames between pulses", grow_interval_rt[None], 5, 120)
+    relx = window.GUI.slider_int("Relax frames after pulse", relax_interval_rt[None], 0, 60)
+    
+    # Commit slider values to runtime fields (no snap-back!)
+    grow_rate_rt[None] = rate
+    grow_interval_rt[None] = gap
+    relax_interval_rt[None] = relx
+    
+    # Status line showing current timer state
+    if relax_timer[None] > 0:
+        window.GUI.text(f"Relaxing... {relax_timer[None]} frames left")
+    else:
+        window.GUI.text(f"Next pulse in {pulse_timer[None]} frames")
+    window.GUI.text("")
+    
     # System configuration section
     window.GUI.text(f"=== System Config ===")
     pbc_status = "ON" if PBC_ENABLED else "OFF"
     window.GUI.text(f"PBC: {pbc_status} (restart to change)")
+    topo_status = "ON" if TOPO_ENABLED else "OFF"
+    window.GUI.text(f"Topology (Gabriel): {topo_status} (slow!)")
     window.GUI.text("")
     
     # Visualization section
@@ -460,6 +671,22 @@ while window.running:
     window.GUI.end()
     
     window.show()
+    ti.sync()
+    t_render = time.perf_counter()
+    
+    # === PERFORMANCE PROFILING OUTPUT ===
+    if not paused and frame % 60 == 0:  # Every 60 frames
+        dt_grid = t_grid - t_start
+        dt_pbd = t_pbd - t_grid
+        dt_topo = t_topo - t_pbd
+        dt_render = t_render - t_topo
+        dt_total = t_render - t_start
+        
+        topo_status = f"{dt_topo:.3f}s" if topo_did_run else "—"
+        fps_estimate = 1.0 / dt_total if dt_total > 0 else 0.0
+        
+        print(f"\n[PERF] Frame {frame}: grid={dt_grid:.3f}s  pbd={dt_pbd:.3f}s  topo={topo_status}  render={dt_render:.3f}s  | FPS≈{fps_estimate:.1f}")
+        print(f"       Breakdown: grid={100*dt_grid/dt_total:.0f}%  pbd={100*dt_pbd/dt_total:.0f}%  topo={100*dt_topo/dt_total:.0f}%  render={100*dt_render/dt_total:.0f}%")
 
 print("\n[Exit] Simulation ended.")
 print(f"       Total frames: {frame}")

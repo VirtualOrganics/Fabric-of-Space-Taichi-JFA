@@ -20,7 +20,9 @@ from config import (
     DEEP_OVERLAP_THRESHOLD, FORCE_STIFFNESS_MULTIPLIER, FORCE_DAMPING, GLOBAL_DAMPING,
     RADIUS_COMPLIANCE, RADIUS_RATE_LIMIT, DT,
     XSPH_EPSILON,
-    PBC_ENABLED, HALF_L, INV_L
+    PBC_ENABLED, HALF_L, INV_L,
+    JITTER_ENABLED, JITTER_RMS, JITTER_TAU, MAX_DRIFT_FRACTION,
+    LEVY_ENABLED, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC, LEVY_USE_TOPO_DEG
 )
 from grid import pdelta, wrap_cell, cell_id, wrapP
 
@@ -368,31 +370,36 @@ def apply_global_damping(vel: ti.template(), n: ti.i32):
 
 @ti.kernel
 def update_radii_xpbd(rad: ti.template(), deg: ti.template(), n: ti.i32, dt: ti.f32,
-                       r_min: ti.f32, r_max: ti.f32):
+                       r_min: ti.f32, r_max: ti.f32, deg_low: ti.i32, deg_high: ti.i32,
+                       gain_grow: ti.f32, gain_shrink: ti.f32, rate_limit: ti.f32):
     """
     XPBD-compliant radius adaptation.
     Frame-rate independent, rate-limited.
-    Accepts runtime-adjustable min/max radius limits.
+    Accepts runtime-adjustable parameters:
+      - r_min, r_max: radius bounds
+      - deg_low, deg_high: degree thresholds
+      - gain_grow, gain_shrink: growth/shrink rates
+      - rate_limit: max fractional change per frame (runtime, auto-enforced >= gain)
     """
     for i in range(n):
         d = deg[i]
         r_old = rad[i]
         
-        # Compute desired change (5% rule)
+        # Compute desired change (configurable gain)
         desired_change = 0.0
-        if d < DEG_LOW:
-            desired_change = 0.05 * r_old  # Grow 5%
-        elif d > DEG_HIGH:
-            desired_change = -0.05 * r_old  # Shrink 5%
-        # else: no change (d in [DEG_LOW, DEG_HIGH])
+        if d < deg_low:
+            desired_change = gain_grow * r_old  # Grow by gain_grow
+        elif d > deg_high:
+            desired_change = -gain_shrink * r_old  # Shrink by gain_shrink
+        # else: no change (d in [deg_low, deg_high])
         
         # XPBD constraint resolution
         # Compliance α makes this frame-rate independent
         alpha = RADIUS_COMPLIANCE
         delta_r = desired_change / (1.0 + alpha / (dt * dt))
         
-        # Rate limit: max 2% change per frame
-        max_delta = RADIUS_RATE_LIMIT * r_old
+        # Rate limit: max rate_limit% change per frame (runtime parameter)
+        max_delta = rate_limit * r_old
         delta_r = ti.max(-max_delta, ti.min(max_delta, delta_r))
         
         # Apply
@@ -468,4 +475,237 @@ def apply_xsph_smoothing(pos: ti.template(), vel: ti.template(), vel_temp: ti.te
     # Copy back from temp to vel
     for i in range(n):
         vel[i] = vel_temp[i]
+
+
+# ==============================================================================
+# Kernel 7: Brownian Motion (Ornstein-Uhlenbeck smooth drift)
+# ==============================================================================
+
+@ti.kernel
+def init_jitter_velocities(v_jit: ti.template(), n: ti.i32):
+    """Initialize jitter velocities to zero."""
+    for i in range(n):
+        v_jit[i] = ti.Vector([0.0, 0.0, 0.0])
+
+
+@ti.kernel
+def apply_brownian(v_jit: ti.template(), rad: ti.template(), 
+                   mean_radius: ti.template(), n: ti.i32, dt: ti.f32):
+    """
+    Apply smooth Brownian drift using Ornstein-Uhlenbeck (OU) noise.
+    
+    Updates:
+        v_jit: per-particle jitter velocity (vec3 field)
+    
+    This creates gentle, smooth motion without atomics or PBD destabilization.
+    OU process: dv = -(v/τ)*dt + σ*sqrt(dt)*ξ
+    where ξ ~ U[-0.5,0.5]³ (cheap approx to Gaussian)
+    """
+    if ti.static(JITTER_ENABLED):
+        mean_r = mean_radius[None]
+        
+        # Target RMS step size: JITTER_RMS * mean_radius per second
+        # OU formula: σ = target_rms * sqrt(2 / τ)
+        sigma = JITTER_RMS * mean_r * ti.sqrt(2.0 / ti.max(1e-6, JITTER_TAU))
+        
+        for i in range(n):
+            # Random vector: U[-0.5, 0.5]³ (cheap approximation to Gaussian)
+            r = ti.Vector([
+                ti.random(ti.f32) - 0.5,
+                ti.random(ti.f32) - 0.5,
+                ti.random(ti.f32) - 0.5
+            ])
+            
+            # OU update: dv = -(v/τ)*dt + σ*sqrt(dt)*ξ
+            v = v_jit[i]
+            v += (- v / ti.max(1e-6, JITTER_TAU)) * dt + sigma * ti.sqrt(dt) * r
+            
+            # Cap per-step drift to protect PBD
+            # Allow ≤ MAX_DRIFT_FRACTION * GAP * local_size
+            cap = MAX_DRIFT_FRACTION * GAP_FRACTION * (rad[i] + rad[i])
+            L = ti.sqrt(v.dot(v)) * dt  # Step length
+            if L > cap:
+                v *= (cap / ti.max(1e-6, L)) / dt  # Scale back
+            
+            v_jit[i] = v
+
+
+@ti.kernel
+def integrate_jitter(pos: ti.template(), v_jit: ti.template(), n: ti.i32, dt: ti.f32):
+    """
+    Integrate jitter velocities into positions with PBC wrapping.
+    
+    Updates:
+        pos: particle positions (wrapped to [-L/2, L/2)³)
+    """
+    if ti.static(JITTER_ENABLED):
+        for i in range(n):
+            # Update position and wrap (PBC-safe)
+            pos[i] = wrapP(pos[i] + v_jit[i] * dt)
+
+
+# ==============================================================================
+# Kernel 8: Lévy Positional Diffusion (Track 2 - Topological Regularization)
+# ==============================================================================
+# These kernels implement the Lévy centroidal relaxation approximation.
+# Particles diffuse toward the spatial average of better-connected neighbors,
+# creating smooth, self-organizing foam structure.
+#
+# References:
+# - Lévy, B. et al. "Centroidal Voronoi Tesselations" (2010)
+# - Phase B blueprint: Lévy Diffusion Addendum
+
+@ti.kernel
+def compute_mean_radius(rad: ti.template(), n: ti.i32, mean_radius: ti.template()):
+    """
+    Compute global mean radius for step size normalization.
+    
+    Updates:
+        mean_radius[None]: scalar field with mean radius value
+    
+    Note:
+        This is a simple sequential reduction. For N > 50k, consider
+        a parallel reduction kernel for better performance.
+    """
+    acc = 0.0
+    for i in range(n):
+        acc += rad[i]
+    mean_radius[None] = acc / ti.max(1, n)
+
+
+@ti.kernel
+def smooth_degree(deg: ti.template(), deg_smoothed: ti.template(), 
+                  n: ti.i32, alpha: ti.f32):
+    """
+    Apply Exponential Moving Average (EMA) smoothing to degree values.
+    
+    Smoothing reduces high-frequency noise in degree counts, leading to
+    more stable Lévy diffusion behavior.
+    
+    Formula:
+        deg_smoothed[i] = (1 - α) * deg_smoothed[i] + α * deg[i]
+    
+    Typical α values:
+        - 0.1: Very smooth, slow response
+        - 0.25: Good balance (recommended)
+        - 0.5: Fast response, less smoothing
+    
+    Updates:
+        deg_smoothed: smoothed degree field (EMA state)
+    """
+    for i in range(n):
+        # EMA update
+        deg_smoothed[i] = (1.0 - alpha) * deg_smoothed[i] + alpha * ti.cast(deg[i], ti.f32)
+
+
+@ti.kernel
+def levy_position_diffusion(pos: ti.template(), deg_smoothed: ti.template(),
+                            cell_start: ti.template(), cell_count: ti.template(),
+                            cell_indices: ti.template(), mean_radius: ti.template(),
+                            n: ti.i32, alpha_diffusion: ti.f32, 
+                            degree_span: ti.f32, max_step_frac: ti.f32):
+    """
+    Lévy positional diffusion: particles shift toward better-connected neighbors.
+    
+    This kernel implements a discrete approximation of Lévy's centroidal power
+    diagram relaxation. Each particle moves toward the spatial average of neighbors
+    weighted by their degree difference.
+    
+    Algorithm:
+        1. For each particle i, iterate over geometric neighbors j
+        2. Compute weight w = clamp((deg_j - deg_i) / span, -1, 1)
+        3. Accumulate weighted displacement: Δp_i += w * (p_j - p_i)
+        4. Normalize by neighbor count: Δp_i /= count
+        5. Clamp step size to max_step_frac * mean_radius
+        6. Update position with PBC wrapping: p_i += α * Δp_i
+    
+    Parameters:
+        pos: particle positions (updated in-place)
+        deg_smoothed: smoothed degree values (geometric or topological)
+        cell_start, cell_count, cell_indices: spatial grid structure
+        mean_radius: global mean radius (for step size clamping)
+        n: number of active particles
+        alpha_diffusion: diffusion gain (typical: 0.04)
+        degree_span: normalization constant for degree differences (typical: 10.0)
+        max_step_frac: max step as fraction of mean radius (typical: 0.15)
+    
+    Notes:
+        - Uses PBC-aware distance calculation (pdelta)
+        - Step size clamping prevents large jumps that could destabilize PBD
+        - No atomics required (pure per-particle computation)
+        - Cost: O(27 * avg_neighbors_per_cell * N) per call
+    
+    Future:
+        Once Phase B's Gabriel topology is restored, swap deg_smoothed source
+        from geometric to topological degree (topo_deg_ema) by setting
+        LEVY_USE_TOPO_DEG = True in config.py
+    """
+    if ti.static(LEVY_ENABLED):
+        mean_r = mean_radius[None]
+        
+        for i in range(n):
+            pi = pos[i]
+            deg_i = deg_smoothed[i]
+            
+            # Accumulate weighted shift from neighbors
+            shift = ti.Vector([0.0, 0.0, 0.0])
+            count = 0
+            
+            # --- Compute my cell coordinate (PBC-aware) ---
+            p_wrapped = wrapP(pi)
+            q = (p_wrapped + HALF_L) * INV_L
+            my_cell = ti.Vector([int(q[d] * GRID_RES) for d in ti.static(range(3))])
+            
+            # --- Iterate over 3x3x3 neighborhood ---
+            for dx in ti.static(range(-1, 2)):
+                for dy in ti.static(range(-1, 2)):
+                    for dz in ti.static(range(-1, 2)):
+                        # Neighbor cell (wrapped)
+                        nc = my_cell + ti.Vector([dx, dy, dz])
+                        nc = wrap_cell(nc)
+                        nc_id = cell_id(nc)
+                        
+                        # Iterate particles in this cell
+                        start = cell_start[nc_id]
+                        cell_particle_count = cell_count[nc_id]
+                        for k_idx in range(start, start + cell_particle_count):
+                            j = cell_indices[k_idx]
+                            
+                            # Skip self
+                            if j == i:
+                                continue
+                            
+                            # Neighbor degree and position
+                            deg_j = deg_smoothed[j]
+                            pj = pos[j]
+                            
+                            # Compute weight: normalized degree difference
+                            # w > 0 if j has more neighbors (attract toward j)
+                            # w < 0 if j has fewer neighbors (repel from j)
+                            w = tm.clamp((deg_j - deg_i) / degree_span, -1.0, 1.0)
+                            
+                            # Skip negligible weights (optimization)
+                            if abs(w) < 1e-4:
+                                continue
+                            
+                            # PBC-aware displacement vector (j → i)
+                            dir_vec = pdelta(pj, pi)
+                            
+                            # Accumulate weighted shift
+                            shift += w * dir_vec
+                            count += 1
+            
+            # --- Apply diffusion step ---
+            if count > 0:
+                # Average shift
+                shift /= ti.cast(count, ti.f32)
+                
+                # Clamp step size to prevent large jumps
+                max_step = max_step_frac * mean_r
+                L = shift.norm()
+                if L > max_step:
+                    shift = shift.normalized() * max_step
+                
+                # Update position with diffusion gain and PBC wrapping
+                pos[i] = wrapP(pi + alpha_diffusion * shift)
 
