@@ -709,3 +709,134 @@ def levy_position_diffusion(pos: ti.template(), deg_smoothed: ti.template(),
                 # Update position with diffusion gain and PBC wrapping
                 pos[i] = wrapP(pi + alpha_diffusion * shift)
 
+
+# ==============================================================================
+# Visualization: Size-based colormaps and band highlighting
+# ==============================================================================
+
+@ti.func
+def clamp01(x: ti.f32) -> ti.f32:
+    """Clamp value to [0, 1] range."""
+    return ti.min(1.0, ti.max(0.0, x))
+
+@ti.func
+def colormap_viridis(t: ti.f32) -> ti.types.vector(3, ti.f32):
+    """
+    Viridis colormap (perceptually uniform, colorblind-friendly).
+    Polynomial approximation for lightweight GPU evaluation.
+    """
+    t = clamp01(t)
+    r = 0.2803 + 0.2331*t + 0.1533*t*t - 0.3130*t*t*t
+    g = 0.0040 + 0.8090*t - 0.1520*t*t - 0.1140*t*t*t
+    b = 0.3340 + 1.1960*t - 1.2460*t*t + 0.3620*t*t*t
+    return ti.Vector([clamp01(r), clamp01(g), clamp01(b)])
+
+@ti.func
+def colormap_turbo(t: ti.f32) -> ti.types.vector(3, ti.f32):
+    """
+    Google Turbo colormap (high contrast, punchy).
+    Polynomial fit for GPU evaluation.
+    """
+    t = clamp01(t)
+    r = 0.13572138 + 4.61539260*t - 42.66032258*t*t + 132.13108234*t*t*t - 152.94239396*t*t*t*t + 59.28637943*t*t*t*t*t
+    g = 0.09140261 + 2.19418839*t +   4.84296658*t*t -  14.18503333*t*t*t +   4.27729857*t*t*t*t +  2.82956604*t*t*t*t*t
+    b = 0.10667330 + 8.40954615*t -  33.31800624*t*t +  60.19473600*t*t*t -  56.29973286*t*t*t*t +  20.03382602*t*t*t*t*t
+    return ti.Vector([clamp01(r), clamp01(g), clamp01(b)])
+
+@ti.func
+def colormap_inferno(t: ti.f32) -> ti.types.vector(3, ti.f32):
+    """
+    Inferno colormap (warm, good for heat maps).
+    Lightweight approximation.
+    """
+    t = clamp01(t)
+    r = clamp01(0.000 + 2.0*t - 0.5*t*t)
+    g = clamp01(-0.1 + 2.8*t - 2.1*t*t + 0.3*t*t*t)
+    b = clamp01(0.2 + 0.5*t + 1.2*t*t - 1.1*t*t*t)
+    return ti.Vector([r, g, b])
+
+@ti.func
+def pick_palette(palette_id: ti.i32, t: ti.f32) -> ti.types.vector(3, ti.f32):
+    """
+    Select colormap by ID:
+      0 = Viridis (perceptually uniform)
+      1 = Turbo (high contrast)
+      2 = Inferno (warm)
+    """
+    result = ti.Vector([0.5, 0.5, 0.5])  # Default gray
+    if palette_id == 0:
+        result = colormap_viridis(t)
+    elif palette_id == 1:
+        result = colormap_turbo(t)
+    elif palette_id == 2:
+        result = colormap_inferno(t)
+    return result
+
+@ti.kernel
+def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.template(),
+                          n: ti.i32, rad_min: ti.f32, rad_max: ti.f32,
+                          deg_low: ti.i32, deg_high: ti.i32,
+                          viz_mode: ti.i32, band_min: ti.f32, band_max: ti.f32,
+                          hide_out: ti.i32, palette: ti.i32, dim_alpha: ti.f32):
+    """
+    Update particle colors based on visualization mode:
+      Mode 0: Degree-based (original, red/green/blue by neighbor count)
+      Mode 1: Size heatmap (colormap by radius)
+      Mode 2: Size band highlight (brighten in-band, dim/hide out-of-band)
+    
+    Args:
+        rad: particle radii
+        deg: particle degrees (neighbor counts)
+        color: output RGB colors
+        n: number of active particles
+        rad_min, rad_max: observed radius range for normalization
+        deg_low, deg_high: degree band thresholds
+        viz_mode: 0=degree, 1=heatmap, 2=band
+        band_min, band_max: radius band for mode 2
+        hide_out: 0=dim, 1=hide out-of-band
+        palette: 0=viridis, 1=turbo, 2=inferno
+        dim_alpha: brightness for out-of-band particles
+    """
+    span = ti.max(1e-9, rad_max - rad_min)  # Avoid division by zero
+    
+    for i in range(n):
+        r = rad[i]
+        d = deg[i]
+        
+        # Normalize radius to [0, 1] for colormap
+        t = (r - rad_min) / span
+        t = clamp01(t)
+        
+        # Default color (gray)
+        c = ti.Vector([0.5, 0.5, 0.5])
+        
+        # Mode 0: Degree-based colors (original logic)
+        if viz_mode == 0:
+            if d < deg_low:
+                c = ti.Vector([1.0, 0.2, 0.2])  # Red: low degree (growing)
+            elif d > deg_high:
+                c = ti.Vector([0.2, 0.2, 1.0])  # Blue: high degree (shrinking)
+            else:
+                c = ti.Vector([0.2, 1.0, 0.2])  # Green: in-band (stable)
+        
+        # Mode 1: Size heatmap (colormap by radius)
+        elif viz_mode == 1:
+            c = pick_palette(palette, t)
+        
+        # Mode 2: Size band highlight
+        else:  # viz_mode == 2
+            in_band = (r >= band_min) and (r <= band_max)
+            if in_band:
+                # In-band: full brightness with colormap
+                c = pick_palette(palette, t)
+            else:
+                # Out-of-band: dim or hide
+                if hide_out == 1:
+                    # Hide: nearly black (renderer still draws, but invisible)
+                    c = ti.Vector([0.0, 0.0, 0.0])
+                else:
+                    # Dim: soft gray based on dim_alpha
+                    c = ti.Vector([dim_alpha, dim_alpha, dim_alpha])
+        
+        color[i] = c
+

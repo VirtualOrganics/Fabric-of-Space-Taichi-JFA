@@ -49,7 +49,8 @@ from dynamics import (
     apply_repulsive_forces, integrate_velocities, apply_global_damping,
     update_radii_xpbd, apply_xsph_smoothing,
     init_jitter_velocities, apply_brownian, integrate_jitter,
-    compute_mean_radius, smooth_degree, levy_position_diffusion
+    compute_mean_radius, smooth_degree, levy_position_diffusion,
+    update_colors_by_size
 )
 
 # Phase B: Topological neighbor counting
@@ -91,6 +92,14 @@ relax_interval_rt = ti.field(dtype=ti.i32, shape=())     # Relax frames after pu
 pulse_timer = ti.field(dtype=ti.i32, shape=())           # Frames until next pulse
 relax_timer = ti.field(dtype=ti.i32, shape=())           # Frames remaining in relax window
 
+# Visualization runtime controls (0D Taichi fields - GUI edits these directly)
+viz_mode_rt = ti.field(dtype=ti.i32, shape=())           # 0=Degree, 1=Size Heatmap, 2=Size Band
+viz_band_min_rt = ti.field(dtype=ti.f32, shape=())       # Band min radius (for mode 2)
+viz_band_max_rt = ti.field(dtype=ti.f32, shape=())       # Band max radius (for mode 2)
+viz_hide_out_rt = ti.field(dtype=ti.i32, shape=())       # 0=dim, 1=hide out-of-band
+viz_palette_rt = ti.field(dtype=ti.i32, shape=())        # 0=Viridis, 1=Turbo, 2=Inferno
+viz_dim_alpha_rt = ti.field(dtype=ti.f32, shape=())      # Dim factor for out-of-band particles
+
 # Grid data
 cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
 cell_start = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Prefix sum (read-only)
@@ -122,6 +131,15 @@ def init_rhythm_runtime():
     relax_interval_rt[None] = RELAX_INTERVAL_DEFAULT
     pulse_timer[None] = GROWTH_INTERVAL_DEFAULT  # First pulse after N frames
     relax_timer[None] = 0
+
+def init_visual_runtime():
+    """Initialize visualization runtime fields to sensible defaults."""
+    viz_mode_rt[None] = 0          # Start with degree-based colors
+    viz_band_min_rt[None] = R_MIN  # Start with full range
+    viz_band_max_rt[None] = R_MAX
+    viz_hide_out_rt[None] = 0      # Dim by default (not hide)
+    viz_palette_rt[None] = 1       # Turbo (punchy, good contrast)
+    viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
@@ -225,6 +243,9 @@ def initialize_simulation(n):
     # Initialize growth/relax rhythm (load defaults into runtime fields)
     init_rhythm_runtime()
     
+    # Initialize visualization settings
+    init_visual_runtime()
+    
     # Warmup PBD
     warmup_pbd(n)
     
@@ -315,6 +336,10 @@ gui_r_max = R_MAX  # Maximum radius (meters)
 # GUI: Adjustable particle count
 gui_n_particles = N  # Number of particles (can be changed and restarted)
 restart_requested = False  # Flag to trigger restart
+
+# Radius range tracking (for size-based visualization)
+r_obs_min = R_MIN  # Observed minimum radius (updated periodically)
+r_obs_max = R_MAX  # Observed maximum radius (updated periodically)
 
 # Main loop
 paused = False
@@ -529,8 +554,17 @@ while window.running:
                 for i in range(active_n):
                     deg[i] = int(deg_topo_np[i])
         
-        # === 9. Update colors (with runtime-adjustable band thresholds) ===
-        update_colors(deg, color, active_n, gui_deg_low, gui_deg_high)
+        # === 12. Update observed radius range (every 15 frames for GUI context) ===
+        if frame % 15 == 0:
+            rad_np_sample = rad.to_numpy()[:active_n]
+            r_obs_min = float(rad_np_sample.min()) if active_n > 0 else R_MIN
+            r_obs_max = float(rad_np_sample.max()) if active_n > 0 else R_MAX
+        
+        # === 13. Update colors (size-based or degree-based, runtime-switchable) ===
+        update_colors_by_size(rad, deg, color, active_n, r_obs_min, r_obs_max,
+                             gui_deg_low, gui_deg_high,
+                             viz_mode_rt[None], viz_band_min_rt[None], viz_band_max_rt[None],
+                             viz_hide_out_rt[None], viz_palette_rt[None], viz_dim_alpha_rt[None])
         
         ti.sync()
         t_topo = time.perf_counter()
@@ -667,6 +701,47 @@ while window.running:
     
     # Visualization section
     window.GUI.text(f"=== Visualization ===")
+    
+    # Color mode selector
+    mode_labels = ["Degree", "Size Heatmap", "Size Band"]
+    viz_mode_rt[None] = window.GUI.slider_int("Color Mode", viz_mode_rt[None], 0, 2)
+    window.GUI.text(f"  Mode: {mode_labels[viz_mode_rt[None]]}")
+    
+    # Palette selector (for size modes)
+    if viz_mode_rt[None] >= 1:
+        palette_labels = ["Viridis", "Turbo", "Inferno"]
+        viz_palette_rt[None] = window.GUI.slider_int("Palette", viz_palette_rt[None], 0, 2)
+        window.GUI.text(f"  {palette_labels[viz_palette_rt[None]]}")
+    
+    # Size band controls (only for mode 2)
+    if viz_mode_rt[None] == 2:
+        window.GUI.text(f"  Range: [{r_obs_min:.5f}, {r_obs_max:.5f}]")
+        
+        band_min = viz_band_min_rt[None]
+        band_max = viz_band_max_rt[None]
+        
+        band_min = window.GUI.slider_float("Band min", band_min, 0.0, 0.010)
+        band_max = window.GUI.slider_float("Band max", band_max, 0.0, 0.010)
+        
+        # Ensure min <= max
+        if band_max < band_min:
+            band_max = band_min
+        
+        viz_band_min_rt[None] = band_min
+        viz_band_max_rt[None] = band_max
+        
+        # Hide/dim toggle
+        hide_bool = viz_hide_out_rt[None] == 1
+        hide_bool = window.GUI.checkbox("Hide out-of-band", hide_bool)
+        viz_hide_out_rt[None] = 1 if hide_bool else 0
+        
+        # Dim slider (only if not hiding)
+        if viz_hide_out_rt[None] == 0:
+            dim = viz_dim_alpha_rt[None]
+            dim = window.GUI.slider_float("Dim level", dim, 0.0, 0.5)
+            viz_dim_alpha_rt[None] = dim
+    
+    window.GUI.text("")
     show_centers_only = window.GUI.checkbox("Show centers only", show_centers_only)
     window.GUI.end()
     
