@@ -141,8 +141,10 @@ def init_rhythm_runtime():
 def init_visual_runtime():
     """Initialize visualization runtime fields to sensible defaults."""
     viz_mode_rt[None] = 0          # Start with degree-based colors
-    viz_band_min_rt[None] = R_MIN  # Start with full range
-    viz_band_max_rt[None] = R_MAX
+    # Default band: middle third of radius range (good starting point for inspection)
+    range_span = R_MAX - R_MIN
+    viz_band_min_rt[None] = R_MIN + range_span * 0.33
+    viz_band_max_rt[None] = R_MIN + range_span * 0.67
     viz_hide_out_rt[None] = 0      # Dim by default (not hide)
     viz_palette_rt[None] = 1       # Turbo (punchy, good contrast)
     viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band

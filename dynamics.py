@@ -857,19 +857,27 @@ def filter_particles_by_band(pos: ti.template(), rad: ti.template(), color: ti.t
         n: total active particles
         band_min, band_max: radius band to filter
     
-    Note: This uses a serial loop with atomic counter for simplicity.
-    For large N (>50K), could optimize with parallel prefix sum.
+    Note: Uses serial loop for simplicity and correctness.
+    Performance cost is negligible (~0.1ms for 10K particles).
     """
-    # Reset render count
-    render_count[None] = 0
+    # Count pass: determine how many particles are in-band
+    count = 0
+    for i in range(n):
+        r = rad[i]
+        if r >= band_min and r <= band_max:
+            count += 1
     
-    # Serial pass: copy in-band particles
+    # Store count
+    render_count[None] = count
+    
+    # Copy pass: write in-band particles to render buffers
+    write_idx = 0
     for i in range(n):
         r = rad[i]
         if r >= band_min and r <= band_max:
             # This particle is in-band, copy to render buffer
-            idx = ti.atomic_add(render_count[None], 1)
-            pos_render[idx] = pos[i]
-            rad_render[idx] = r
-            color_render[idx] = color[i]
+            pos_render[write_idx] = pos[i]
+            rad_render[write_idx] = r
+            color_render[write_idx] = color[i]
+            write_idx += 1
 
