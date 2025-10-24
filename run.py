@@ -141,10 +141,10 @@ def init_rhythm_runtime():
 def init_visual_runtime():
     """Initialize visualization runtime fields to sensible defaults."""
     viz_mode_rt[None] = 0          # Start with degree-based colors
-    # Default band: middle third of radius range (good starting point for inspection)
-    range_span = R_MAX - R_MIN
-    viz_band_min_rt[None] = R_MIN + range_span * 0.33
-    viz_band_max_rt[None] = R_MIN + range_span * 0.67
+    # Default band: FULL radius range initially (user adjusts after seeing actual range)
+    # Don't use config R_MIN/R_MAX because particles evolve to different ranges!
+    viz_band_min_rt[None] = 0.0    # Start at zero (user will adjust)
+    viz_band_max_rt[None] = 0.010  # Start at slider max (user will adjust)
     viz_hide_out_rt[None] = 0      # Dim by default (not hide)
     viz_palette_rt[None] = 1       # Turbo (punchy, good contrast)
     viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band
@@ -762,7 +762,17 @@ while window.running:
     
     # Size band controls (only for mode 2)
     if viz_mode_rt[None] == 2:
-        window.GUI.text(f"  Range: [{r_obs_min:.5f}, {r_obs_max:.5f}]")
+        window.GUI.text(f"  Observed: [{r_obs_min:.5f}, {r_obs_max:.5f}]")
+        
+        # Quick-set buttons
+        if window.GUI.button("Use Full Range"):
+            viz_band_min_rt[None] = r_obs_min
+            viz_band_max_rt[None] = r_obs_max
+        
+        if window.GUI.button("Use Middle Third"):
+            span = r_obs_max - r_obs_min
+            viz_band_min_rt[None] = r_obs_min + span * 0.33
+            viz_band_max_rt[None] = r_obs_min + span * 0.67
         
         band_min = viz_band_min_rt[None]
         band_max = viz_band_max_rt[None]
