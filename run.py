@@ -50,7 +50,7 @@ from dynamics import (
     update_radii_xpbd, apply_xsph_smoothing,
     init_jitter_velocities, apply_brownian, integrate_jitter,
     compute_mean_radius, smooth_degree, levy_position_diffusion,
-    update_colors_by_size
+    update_colors_by_size, filter_particles_by_band
 )
 
 # Phase B: Topological neighbor counting
@@ -80,6 +80,12 @@ deg_smoothed = ti.field(dtype=ti.f32, shape=MAX_N)     # Smoothed degree (EMA, f
 color = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # RGB color for rendering
 vel = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Velocities (for force fallback)
 vel_temp = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Temporary buffer for XSPH
+
+# Rendering buffers (for filtered visualization in band mode)
+pos_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Filtered positions for rendering
+rad_render = ti.field(dtype=ti.f32, shape=MAX_N)              # Filtered radii for rendering
+color_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Filtered colors for rendering
+render_count = ti.field(dtype=ti.i32, shape=())               # Number of particles to render
 
 # Brownian motion (OU jitter velocities)
 v_jit = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)   # Jitter velocities (OU process)
@@ -616,13 +622,30 @@ while window.running:
     scene.ambient_light((0.8, 0.8, 0.8))
     scene.point_light(pos=(0.5, 1.0, 0.5), color=(1, 1, 1))
     
-    # Render particles: either as center points or full spheres with variable radii
-    if show_centers_only:
-        # Show only center points (tiny uniform radius)
-        scene.particles(pos, radius=0.0005, per_vertex_color=color)
+    # Decide which particles to render based on visualization mode
+    use_filtered = (viz_mode_rt[None] == 2 and viz_hide_out_rt[None] == 1)
+    
+    if use_filtered:
+        # Band mode with hide: filter to in-band particles only
+        filter_particles_by_band(pos, rad, color, pos_render, rad_render, color_render,
+                                render_count, active_n, viz_band_min_rt[None], viz_band_max_rt[None])
+        n_render = render_count[None]
+        
+        # Render filtered particles (true transparency - out-of-band not drawn)
+        if show_centers_only:
+            scene.particles(pos_render, radius=0.0005, per_vertex_color=color_render)
+        else:
+            scene.particles(pos_render, radius=0.001, per_vertex_radius=rad_render, per_vertex_color=color_render)
     else:
-        # Show full spheres with VARIABLE RADII and DEGREE COLORS
-        scene.particles(pos, radius=0.001, per_vertex_radius=rad, per_vertex_color=color)
+        # Normal rendering: all active particles
+        n_render = active_n
+        
+        if show_centers_only:
+            # Show only center points (tiny uniform radius)
+            scene.particles(pos, radius=0.0005, per_vertex_color=color)
+        else:
+            # Show full spheres with VARIABLE RADII and DEGREE COLORS
+            scene.particles(pos, radius=0.001, per_vertex_radius=rad, per_vertex_color=color)
     
     canvas.scene(scene)
     
@@ -734,6 +757,14 @@ while window.running:
         hide_bool = viz_hide_out_rt[None] == 1
         hide_bool = window.GUI.checkbox("Hide out-of-band", hide_bool)
         viz_hide_out_rt[None] = 1 if hide_bool else 0
+        
+        # Show count of in-band particles if hiding
+        if viz_hide_out_rt[None] == 1:
+            # Count particles in band (quick Python check for display)
+            rad_np_band = rad.to_numpy()[:active_n]
+            in_band_count = np.sum((rad_np_band >= band_min) & (rad_np_band <= band_max))
+            in_band_pct = 100.0 * in_band_count / active_n if active_n > 0 else 0.0
+            window.GUI.text(f"  Showing: {in_band_count}/{active_n} ({in_band_pct:.1f}%)")
         
         # Dim slider (only if not hiding)
         if viz_hide_out_rt[None] == 0:

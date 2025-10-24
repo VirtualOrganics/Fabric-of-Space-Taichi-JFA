@@ -840,3 +840,36 @@ def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.temp
         
         color[i] = c
 
+
+@ti.kernel
+def filter_particles_by_band(pos: ti.template(), rad: ti.template(), color: ti.template(),
+                             pos_render: ti.template(), rad_render: ti.template(), 
+                             color_render: ti.template(), render_count: ti.template(),
+                             n: ti.i32, band_min: ti.f32, band_max: ti.f32):
+    """
+    Copy only in-band particles to render buffers.
+    Used when hiding out-of-band particles for true transparency.
+    
+    Args:
+        pos, rad, color: source particle data
+        pos_render, rad_render, color_render: destination render buffers
+        render_count: output count of in-band particles (0D field)
+        n: total active particles
+        band_min, band_max: radius band to filter
+    
+    Note: This uses a serial loop with atomic counter for simplicity.
+    For large N (>50K), could optimize with parallel prefix sum.
+    """
+    # Reset render count
+    render_count[None] = 0
+    
+    # Serial pass: copy in-band particles
+    for i in range(n):
+        r = rad[i]
+        if r >= band_min and r <= band_max:
+            # This particle is in-band, copy to render buffer
+            idx = ti.atomic_add(render_count[None], 1)
+            pos_render[idx] = pos[i]
+            rad_render[idx] = r
+            color_render[idx] = color[i]
+
