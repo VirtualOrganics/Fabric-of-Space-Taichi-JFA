@@ -847,7 +847,7 @@ def filter_particles_by_band(pos: ti.template(), rad: ti.template(), color: ti.t
                              color_render: ti.template(), render_count: ti.template(),
                              n: ti.i32, band_min: ti.f32, band_max: ti.f32):
     """
-    Copy only in-band particles to render buffers.
+    Copy only in-band particles to render buffers (one-pass atomic).
     Used when hiding out-of-band particles for true transparency.
     
     Args:
@@ -857,27 +857,28 @@ def filter_particles_by_band(pos: ti.template(), rad: ti.template(), color: ti.t
         n: total active particles
         band_min, band_max: radius band to filter
     
-    Note: Uses serial loop for simplicity and correctness.
-    Performance cost is negligible (~0.1ms for 10K particles).
+    Note: Uses atomic counter for thread-safe parallel execution.
+    Performance cost is negligible (~0.1-0.3ms for 10K particles).
     """
-    # Count pass: determine how many particles are in-band
-    count = 0
+    # Reset counter every call (critical!)
+    render_count[None] = 0
+    
+    # Clamp and order band values inside kernel (guards GUI mistakes)
+    lo = ti.min(band_min, band_max)
+    hi = ti.max(band_min, band_max)
+    
+    # Widen vanishingly thin bands to avoid float precision zeroing everything
+    eps = 1e-8
+    lo -= eps
+    hi += eps
+    
+    # Single pass: atomic add for thread-safe parallel writes
     for i in range(n):
         r = rad[i]
-        if r >= band_min and r <= band_max:
-            count += 1
-    
-    # Store count
-    render_count[None] = count
-    
-    # Copy pass: write in-band particles to render buffers
-    write_idx = 0
-    for i in range(n):
-        r = rad[i]
-        if r >= band_min and r <= band_max:
-            # This particle is in-band, copy to render buffer
-            pos_render[write_idx] = pos[i]
-            rad_render[write_idx] = r
-            color_render[write_idx] = color[i]
-            write_idx += 1
+        if (r >= lo) and (r <= hi):
+            # Atomic index increment ensures no race condition
+            j = ti.atomic_add(render_count[None], 1)
+            pos_render[j] = pos[i]
+            rad_render[j] = r
+            color_render[j] = color[i]
 

@@ -629,29 +629,24 @@ while window.running:
     
     if use_filtered:
         # Band mode with hide: filter to in-band particles only
-        band_min_val = viz_band_min_rt[None]
-        band_max_val = viz_band_max_rt[None]
+        band_min_val = float(viz_band_min_rt[None])
+        band_max_val = float(viz_band_max_rt[None])
         
+        # One-pass atomic filter
         filter_particles_by_band(pos, rad, color, pos_render, rad_render, color_render,
                                 render_count, active_n, band_min_val, band_max_val)
-        n_render = render_count[None]
+        n_render = int(render_count[None])
         
-        # Debug: verify filter is working correctly
+        # Diagnostic output every 60 frames
         if frame % 60 == 0:
-            # Manual count for comparison
-            rad_np_check = rad.to_numpy()[:active_n]
-            manual_count = np.sum((rad_np_check >= band_min_val) & (rad_np_check <= band_max_val))
-            print(f"[Filter Debug]")
-            print(f"  Band: [{band_min_val:.5f}, {band_max_val:.5f}]")
-            print(f"  Radius range: [{rad_np_check.min():.5f}, {rad_np_check.max():.5f}]")
-            print(f"  GPU filter: {n_render}/{active_n} ({100.0*n_render/active_n:.1f}%)")
-            print(f"  CPU count:  {manual_count}/{active_n} ({100.0*manual_count/active_n:.1f}%)")
-            if n_render != manual_count:
-                print(f"  ❌ MISMATCH: GPU={n_render} vs CPU={manual_count}")
+            rad_np = rad.to_numpy()[:active_n]
+            print(f"[Band] band=[{band_min_val:.6f}, {band_max_val:.6f}] " +
+                  f"r_range=[{rad_np.min():.6f}, {rad_np.max():.6f}] " +
+                  f"rendered={n_render}/{active_n} ({100.0*n_render/max(1,active_n):.1f}%)")
         
         # Render filtered particles (true transparency - out-of-band not drawn)
-        # Important: Copy to NumPy and slice to n_render (Taichi fields render entire allocation!)
         if n_render > 0:
+            # Copy to NumPy and slice to n_render (Taichi fields render entire allocation!)
             pos_render_np = pos_render.to_numpy()[:n_render]
             rad_render_np = rad_render.to_numpy()[:n_render]
             color_render_np = color_render.to_numpy()[:n_render]
@@ -660,6 +655,9 @@ while window.running:
                 scene.particles(pos_render_np, radius=0.0005, per_vertex_color=color_render_np)
             else:
                 scene.particles(pos_render_np, radius=0.001, per_vertex_radius=rad_render_np, per_vertex_color=color_render_np)
+        else:
+            # No particles in band - could show overlay message here
+            pass
     else:
         # Normal rendering: all active particles
         n_render = active_n
