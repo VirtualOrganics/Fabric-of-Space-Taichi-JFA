@@ -18,7 +18,18 @@ import math
 # ==============================================================================
 
 N = 20000                    # Total number of particles (target mean degree ~5-6)
-DOMAIN_SIZE = 0.15          # Cubic domain side length [0, 0.15)³ (reduced density for PBD breathing room)
+DOMAIN_SIZE = 0.238         # Cubic domain side length (SCALE WITH N - see table below)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCALING TABLE: Match DOMAIN_SIZE to N (keeps same density/degree)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   N = 5,000   → DOMAIN_SIZE = 0.150
+#   N = 10,000  → DOMAIN_SIZE = 0.189  (2x particles  → 1.26x bigger box)
+#   N = 20,000  → DOMAIN_SIZE = 0.238  (4x particles  → 1.59x bigger box)
+#   N = 50,000  → DOMAIN_SIZE = 0.324  (10x particles → 2.16x bigger box)
+#
+# Formula: New_Size = 0.15 × (N / 5000)^(1/3)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # ==============================================================================
 # Density-based radius auto-scaling (keeps look consistent across N)
