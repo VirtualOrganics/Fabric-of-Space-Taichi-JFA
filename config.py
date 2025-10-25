@@ -17,8 +17,8 @@ import math
 # Particle properties
 # ==============================================================================
 
-N = 20000                    # Total number of particles (target mean degree ~5-6)
-DOMAIN_SIZE = 0.238         # Cubic domain side length (SCALE WITH N - see table below)
+N = 5000                    # Total number of particles (target mean degree ~5-6)
+DOMAIN_SIZE = 0.15         # Cubic domain side length (SCALE WITH N - see table below)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCALING TABLE: Match DOMAIN_SIZE to N (keeps same density/degree)
@@ -203,6 +203,8 @@ DT = 0.016                  # Timestep for XPBD (≈60 FPS, adjust for target FP
 
 XSPH_EPSILON = 0.03         # 3% blend with neighbors per frame
                             # Smooths high-frequency oscillations after PBD
+                            # TUNING: Bump to 0.05 if motion looks jittery
+                            #         Drop to 0.02 if motion looks too "glidey"
 XSPH_ENABLED = True         # Set False to disable XSPH smoothing
 
 # ==============================================================================
@@ -317,22 +319,26 @@ STREAK_CAP = 4                  # Cap for momentum amplification
                                 # Limits exponential explosion from long streaks
 
 # ==============================================================================
-# Lévy Positional Diffusion (Track 2: topological regularization)
+# Lévy Positional Diffusion (DISABLED - Not Needed)
 # ==============================================================================
-# This kernel balances positional irregularities through neighbor degree coupling,
-# leading to smoother foam topology (Lévy centroidal relaxation approximation).
-# NOTE: Lévy now runs ONLY during relax frames (controlled by growth rhythm).
+# Lévy diffusion moves particles toward degree-balanced positions (degree-gradient flow).
+# This is useful for equilibrium foam research, but NOT needed for our system because:
+#
+# 1. PBD ALREADY repositions particles after size changes (overlap projection)
+# 2. Degree-based radius adaptation CREATES the target topology (not Lévy)
+# 3. Lévy creates non-physical drift (particles teleport toward high-degree neighbors)
+# 4. Expensive: 2-3x slower relax frames
+#
+# Our physically-grounded loop relies on:
+#   - PBD overlap projection (repositioning after size changes)
+#   - XSPH velocity smoothing (smooth local flow)
+#   - Brownian drift (gentle visual motion)
+#
+# Code kept in repo for research/testing only. Can be manually triggered if needed.
 
-LEVY_ENABLED = True             # Toggle Lévy diffusion (Track 2)
-LEVY_ALPHA = 0.04               # Diffusion gain (0.02-0.05 typical)
-                                # Higher = faster convergence but risk of jitter
-LEVY_DEG_SPAN = 10.0            # Normalize degree difference: Δd / span
-                                # Typical range for geometric degree: 10-15
+LEVY_ENABLED = False            # Toggle Lévy diffusion (KEEP OFF for production)
+LEVY_ALPHA = 0.04               # Diffusion gain (if enabled for research)
+LEVY_DEG_SPAN = 10.0            # Normalize degree difference
 LEVY_STEP_FRAC = 0.15           # Cap step at 15% of mean radius per frame
-                                # Prevents large position jumps
-LEVY_USE_TOPO_DEG = False       # True: use topological degree (topo_deg_ema)
-                                # False: use smoothed geometric degree (deg_smoothed)
-                                # Switch to True once Gabriel topology is restored
-
-# NOTE: Keep RADIUS_RATE_LIMIT >= GROWTH_RATE_DEFAULT to avoid masking pulses
+LEVY_USE_TOPO_DEG = False       # Use geometric degree (deg_smoothed)
 

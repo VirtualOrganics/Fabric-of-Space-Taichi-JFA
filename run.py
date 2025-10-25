@@ -591,10 +591,17 @@ while window.running:
         
         # === 9. MOTION happens every frame (PBD already done above) ===
         
-        # === 10. LÉVY: runs ONLY during relax frames ===
+        # === 10. RELAX PHASE: PBD + XSPH + Brownian (Lévy disabled) ===
+        # During relax frames, the physically-grounded loop handles repositioning:
+        #   - PBD (above) separates overlaps and finds tight packing
+        #   - XSPH (above) smooths velocity field to prevent jitter
+        #   - Brownian (above) adds gentle visual motion
+        #
+        # Lévy diffusion is DISABLED (non-physical, expensive, redundant with PBD).
+        # Code kept for optional research/testing only.
         if relax_timer[None] > 0:
             relax_timer[None] -= 1
-            if LEVY_ENABLED:
+            if LEVY_ENABLED:  # OFF by default - only enable for research
                 # Compute mean radius for step size clamping
                 compute_mean_radius(rad, active_n, mean_radius)
                 
