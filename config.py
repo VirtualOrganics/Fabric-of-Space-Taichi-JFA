@@ -48,8 +48,10 @@ CELL_SIZE_OVERRIDE = None
 # Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
 R_MIN_MANUAL = 0.0005       # Minimum particle radius (hard lower bound)
 R_MAX_MANUAL = 0.0500       # Maximum particle radius (hard upper bound - 100x spread)
-R_START_MANUAL = 0.0025     # Starting radius for all particles (uniform seeding)
+R_START_MANUAL = 0.0040     # Starting radius for all particles (uniform seeding)
                             # System will naturally create size distribution via growth/shrink
+                            # Tuning: Increase if particles don't touch initially (no growth)
+                            #         Decrease if too much overlap at startup (slow PBD)
 
 # Periodic Boundary Conditions (PBC)
 PBC_ENABLED = True          # Toggle periodic boundaries (compile-time via ti.static)

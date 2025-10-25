@@ -119,6 +119,9 @@ relax_interval_rt = ti.field(dtype=ti.i32, shape=())     # Relax frames after pu
 pulse_timer = ti.field(dtype=ti.i32, shape=())           # Frames until next pulse
 relax_timer = ti.field(dtype=ti.i32, shape=())           # Frames remaining in relax window
 
+# Runtime particle sizing control
+r_start_rt = ti.field(dtype=ti.f32, shape=())            # Starting radius (for reset/GUI)
+
 # Visualization runtime controls (0D Taichi fields - GUI edits these directly)
 viz_mode_rt = ti.field(dtype=ti.i32, shape=())           # 0=Degree, 1=Size Heatmap, 2=Size Band
 viz_band_min_rt = ti.field(dtype=ti.f32, shape=())       # Band min radius (for mode 2)
@@ -161,6 +164,7 @@ def init_rhythm_runtime():
     relax_interval_rt[None] = RELAX_INTERVAL_DEFAULT
     pulse_timer[None] = GROWTH_INTERVAL_DEFAULT  # First pulse after N frames
     relax_timer[None] = 0
+    r_start_rt[None] = R_START_MANUAL  # Starting radius for particles
 
 def init_visual_runtime():
     """Initialize visualization runtime fields to sensible defaults."""
@@ -421,6 +425,13 @@ while window.running:
             print(f"         Last 20 radii:  {rad_np[active_n-20:active_n] if active_n >= 20 else rad_np[:active_n]}")
             print(f"         PROOF: {len(np.unique(np.round(rad_np[:active_n], 6)))} UNIQUE radius values out of {active_n}")
             print(f"{'='*70}\n")
+        elif window.event.key == 'r' or window.event.key == 'R':
+            # RESET all particles to starting radius
+            r_start_value = r_start_rt[None]
+            for i in range(active_n):
+                rad[i] = r_start_value
+            print(f"\n[Reset] All {active_n} particles reset to radius={r_start_value:.6f}")
+            print(f"        (Particles will grow/shrink from uniform size)")
         elif window.event.key == ti.ui.ESCAPE:
             print("[Control] Exiting...")
             break
@@ -825,6 +836,11 @@ while window.running:
         window.GUI.text(f"Relaxing... {relax_timer[None]} frames left")
     else:
         window.GUI.text(f"Next pulse in {pulse_timer[None]} frames")
+    
+    # Starting radius control
+    r_start = window.GUI.slider_float("Starting radius", r_start_rt[None], 0.0005, 0.0100)
+    r_start_rt[None] = r_start
+    window.GUI.text(f"(Use 'R' to reset all particles to this size)")
     window.GUI.text("")
     
     # System configuration section
