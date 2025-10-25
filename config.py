@@ -17,8 +17,8 @@ import math
 # Particle properties
 # ==============================================================================
 
-N = 25000                    # Total number of particles (target mean degree ~5-6)
-DOMAIN_SIZE = 0.257         # Cubic domain side length (SCALE WITH N - see table below)
+N = 10000                    # Total number of particles (target mean degree ~5-6)
+DOMAIN_SIZE = 0.189         # Cubic domain side length (SCALE WITH N - see table below)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCALING TABLE: Match DOMAIN_SIZE to N (keeps same density/degree)
@@ -48,7 +48,7 @@ CELL_SIZE_OVERRIDE = None
 # Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
 R_MIN_MANUAL = 0.0005       # Minimum particle radius (hard lower bound)
 R_MAX_MANUAL = 0.0500       # Maximum particle radius (hard upper bound - 100x spread)
-R_START_MANUAL = 0.0040     # Starting radius for all particles (uniform seeding)
+R_START_MANUAL = 0.003              #                Starting radius for all particles (uniform seeding)
                             # System will naturally create size distribution via growth/shrink
                             # Tuning: Increase if particles don't touch initially (no growth)
                             #         Decrease if too much overlap at startup (slow PBD)
@@ -96,6 +96,18 @@ def compute_radius_bounds(N, phi_target, domain_size, r_min_factor, r_max_factor
 # Apply auto-scaling (or use manual bounds)
 # ==============================================================================
 
+# ==============================================================================
+# Contact tolerance (must be defined before CELL_SIZE calculation)
+# ==============================================================================
+
+CONTACT_TOL = 0.015         # Contact tolerance: 1.5% beyond touching
+                            # Matches PBD GAP_FRACTION. Particles at (1+TOL)*(r_i+r_j) 
+                            # are counted as neighbors.
+
+# ==============================================================================
+# Apply auto-scaling or use manual bounds (with contact-aware cell sizing)
+# ==============================================================================
+
 if AUTO_SCALE_RADII:
     R_REF, R_MIN, R_MAX, SUGGESTED_CELL_SIZE = compute_radius_bounds(
         N, PHI_TARGET, DOMAIN_SIZE, R_MIN_FACTOR, R_MAX_FACTOR
@@ -115,9 +127,35 @@ else:
     # Use manual bounds
     R_MIN = R_MIN_MANUAL
     R_MAX = R_MAX_MANUAL
-    CELL_SIZE = 2.0 * R_MAX  # Conservative default
+    
+    # Cell size for dynamic reach stencil neighbor search
+    # Strategy: Choose CELL_SIZE small enough to ensure reach=2 (125 cells) at ALL sizes
+    # Formula: r_cut = (1 + CONTACT_TOL) × 2 × r_max
+    #          reach = ceil(r_cut / CELL_SIZE)
+    # 
+    # At startup, particles are ~0.003 (R_START)
+    # At steady state, typical size is ~R_TYPICAL ≈ 0.005-0.010
+    # At maximum, particles can reach R_MAX = 0.050
+    # 
+    # TEMPORARY: Revert to a safe baseline for debugging
+    # Use a moderately-sized cell to avoid extremes
+    R_TYPICAL = 0.010  # Typical particle size during simulation  
+    r_cut_typical = 2.0 * (1.0 + CONTACT_TOL) * R_TYPICAL
+    CELL_SIZE = 0.030  # Fixed size for debugging - should give reach≈1 at typical sizes
     R_REF = None  # Not computed
-    print(f"[Manual] R∈[{R_MIN:.6f}, {R_MAX:.6f}], CELL_SIZE={CELL_SIZE:.6f}")
+    
+    print(f"[DEBUG] CELL_SIZE={CELL_SIZE:.6f}, r_cut_typical={r_cut_typical:.6f}")
+    
+    # Diagnostic printout
+    grid_res_est = int(DOMAIN_SIZE / CELL_SIZE) + 1
+    r_cut_at_typical = 2.0 * (1.0 + CONTACT_TOL) * R_TYPICAL
+    r_cut_at_max = 2.0 * (1.0 + CONTACT_TOL) * R_MAX
+    reach_at_typical = int(math.ceil(r_cut_at_typical / CELL_SIZE))
+    reach_at_max = int(math.ceil(r_cut_at_max / CELL_SIZE))
+    print(f"[Manual] R∈[{R_MIN:.6f}, {R_MAX:.6f}], R_TYPICAL={R_TYPICAL:.6f}")
+    print(f"[Manual] CELL_SIZE={CELL_SIZE:.6f}")
+    print(f"[Manual] Grid: {grid_res_est}×{grid_res_est}×{grid_res_est} = {grid_res_est**3} cells")
+    print(f"[Manual] Expected reach: typical→{reach_at_typical} ({(2*reach_at_typical+1)**3} cells), max→{reach_at_max} ({(2*reach_at_max+1)**3} cells)")
 
 # ==============================================================================
 # Grid parameters (spatial hashing for neighbor search)
@@ -131,10 +169,6 @@ GRID_RES = max(3, int(math.ceil(DOMAIN_SIZE / CELL_SIZE)))
 if R_MAX > 0.5 * CELL_SIZE:
     print(f"[Auto-Scale][WARN] R_MAX ({R_MAX:.6f}) > 0.5×CELL_SIZE ({CELL_SIZE:.6f}). "
           f"Consider increasing CELL_SIZE or GRID_RES for efficiency.")
-
-CONTACT_TOL = 0.015         # Contact tolerance: 1.5% beyond touching
-                            # Matches PBD GAP_FRACTION. Particles at (1+TOL)*(r_i+r_j) 
-                            # are counted as neighbors.
 
 EPS = 1e-8                  # Small epsilon for numerical safety
 
@@ -167,6 +201,19 @@ DISPLACEMENT_MULTIPLIER = 2.0  # Allow more for multi-neighbor cases
 
 GAP_FRACTION = 0.015        # Target gap: 1.5% of (r_i + r_j) (soft breathing room)
                             # Slightly lower than CONTACT_TOL for PBD cushion
+
+# ==============================================================================
+# Geometric Repacking (push-pull to maintain tight packing during size changes)
+# ==============================================================================
+# When particles shrink, they create gaps. When particles grow, they create pressure.
+# This system propagates expansion pressure into shrink gaps through local push/pull forces.
+
+REPACK_ENABLED = False         # DISABLED - standard PBD push only (no pull forces)
+REPACK_DEADZONE_TAU = 0.05     # Dead-zone: don't pull if gap < tau * mean_radius (prevents jitter)
+REPACK_BETA_PUSH = 1.0         # Push strength on overlaps (standard PBD)
+REPACK_BETA_PULL = 0.2         # Pull strength on gaps beyond dead-zone (weaker than push)
+REPACK_EXTRA_PASSES = 6        # Extra PBD passes during repacking to propagate pressure
+REPACK_STEP_CAP_FRAC = 0.25    # Maximum step size as fraction of mean radius (stability)
 
 # ==============================================================================
 # Deep overlap force fallback (rescue mode) - Track 1 (Re-enabled)
@@ -306,18 +353,18 @@ MAX_DRIFT_FRACTION = 0.20       # Cap per-step drift to 20% of GAP
 # These control the discrete pulse/relax cycle for radius adaptation.
 
 GROWTH_RATE_DEFAULT = 0.04      # 4% per pulse (both grow and shrink)
-GROWTH_INTERVAL_DEFAULT = 20    # Frames between pulses
-RELAX_INTERVAL_DEFAULT = 10     # Relax frames after a pulse (PBD + Lévy only)
+ADJUSTMENT_FRAMES_DEFAULT = 30   # Frames to smoothly adjust to target size (per cycle)
 
 # ==============================================================================
 # Decision Stability (hysteresis + streaks)
 # ==============================================================================
 # Prevents decision flip-flop on noise, enabling sustained growth/shrink runs.
 
-HYSTERESIS = 0.6                # Degree units added around band edges
-                                # Prevents chattering when deg ~ DEG_LOW or DEG_HIGH
-STREAK_LOCK = 3                 # Pulses to keep a decision before reconsidering
-                                # Enables multi-pulse growth/shrink runs (e.g., grow ×5)
+HYSTERESIS = 0.0                # Degree units added around band edges (DISABLED)
+                                # Set to 0 so GUI sliders work exactly as shown
+                                # Growth Rhythm cadence already prevents flip-flopping
+STREAK_LOCK = 1                 # Pulses to keep a decision (1 = no locking)
+                                # Growth Rhythm handles timing - no extra locking needed
 MOMENTUM = 0.0                  # Streak momentum (0.10 = 10% gain per streak unit)
                                 # Start at 0.0 (disabled), tune upward for compounding
 STREAK_CAP = 4                  # Cap for momentum amplification

@@ -76,6 +76,9 @@ def wrap_cell(c: ti.math.ivec3) -> ti.math.ivec3:
     Uses double-modulo to handle negative indices correctly:
       (c % N + N) % N
     
+    CRITICAL: Use component-wise modulo for Taichi GPU compatibility.
+    Citation [20] from Perplexity: Python's % on vectors doesn't work correctly in Taichi.
+    
     Args:
         c: Cell indices (can be negative or >= GRID_RES)
     
@@ -83,8 +86,13 @@ def wrap_cell(c: ti.math.ivec3) -> ti.math.ivec3:
         Wrapped cell indices in [0, GRID_RES)³
     """
     if ti.static(PBC_ENABLED):
-        # Double-modulo handles negatives: (-1 % 10 + 10) % 10 = 9
-        return (c % GRID_RES + GRID_RES) % GRID_RES
+        # Component-wise double-modulo for PBC wrapping
+        # Handle each component separately to ensure correct behavior on GPU
+        return ti.math.ivec3([
+            (c[0] % GRID_RES + GRID_RES) % GRID_RES,
+            (c[1] % GRID_RES + GRID_RES) % GRID_RES,
+            (c[2] % GRID_RES + GRID_RES) % GRID_RES
+        ])
     else:
         # Clamp to valid range for bounded domain
         return ti.math.ivec3([
@@ -200,8 +208,9 @@ def count_particles_per_cell(pos: ti.template(), cell_count: ti.template(), n: t
         # Normalize to [0,1)³ using precomputed INV_L
         q = (p_wrapped + HALF_L) * INV_L
         
-        # Cell coordinate (3D index)
-        c = ti.Vector([int(q[d] * GRID_RES) for d in ti.static(range(3))])
+        # Cell coordinate (CORRECT Taichi indexing)
+        # Use ti.cast(ti.floor(...), ti.i32) per Perplexity citation [1]
+        c = ti.cast(ti.floor(q * GRID_RES), ti.i32)
         
         # Wrap cell indices (handles edge cases)
         c = wrap_cell(c)
@@ -281,8 +290,9 @@ def scatter_particles(pos: ti.template(), cell_write: ti.template(),
         # Normalize to [0,1)³ using precomputed INV_L
         q = (p_wrapped + HALF_L) * INV_L
         
-        # Cell coordinate (3D index)
-        c = ti.Vector([int(q[d] * GRID_RES) for d in ti.static(range(3))])
+        # Cell coordinate (CORRECT Taichi indexing)
+        # Use ti.cast(ti.floor(...), ti.i32) per Perplexity citation [1]
+        c = ti.cast(ti.floor(q * GRID_RES), ti.i32)
         
         # Wrap cell indices (handles edge cases)
         c = wrap_cell(c)
@@ -304,59 +314,73 @@ def scatter_particles(pos: ti.template(), cell_write: ti.template(),
 @ti.kernel
 def count_neighbors(pos: ti.template(), rad: ti.template(), deg: ti.template(),
                     cell_start: ti.template(), cell_count: ti.template(),
-                    cell_indices: ti.template(), n: ti.i32):
+                    cell_indices: ti.template(), n: ti.i32, reach: ti.i32):
     """
     Count neighbors within (1 + CONTACT_TOL) * (r_i + r_j).
     This is "near-contact" (not exact touching), matching PBD gap semantics.
     
+    DYNAMIC STENCIL: Uses runtime 'reach' parameter to check (2*reach+1)³ cells.
+    - reach=1 → 3×3×3 = 27 cells (works when CELL_SIZE ≥ r_cut)
+    - reach=2 → 5×5×5 = 125 cells (needed when r_cut/CELL_SIZE > 1)
+    
     For each particle i:
       1. Find my cell
-      2. Check 27 neighboring cells (3x3x3 stencil including self)
+      2. Check (2*reach+1)³ neighboring cells
       3. For each neighbor j in those cells:
          - Compute minimum-image distance
          - Check if within contact threshold
          - Increment deg[i] if yes
     
     Periodic boundaries are handled via modulo wrapping and periodic_delta.
+    
+    Args:
+        reach: Stencil half-width (cells to check in each direction)
+               Should be ceil(r_cut / CELL_SIZE) where r_cut = (1+tol)*2*r_max
     """
     for i in range(n):
         deg[i] = 0  # Reset degree
         
-        # My cell coordinate (PBC-aware, same as scatter_particles)
+        # My cell coordinate (PBC-aware, using CORRECT Taichi index calculation)
+        # Citation [1] from Perplexity: use ti.cast(ti.floor(...), ti.i32) NOT int(...)
         p_wrapped = wrapP(pos[i])
         q = (p_wrapped + HALF_L) * INV_L  # Normalize to [0,1)³
-        my_cell = ti.Vector([int(q[d] * GRID_RES) for d in ti.static(range(3))])
+        my_cell = ti.cast(ti.floor(q * GRID_RES), ti.i32)
         
-        # Check 27 neighboring cells (-1, 0, +1 in each dimension)
-        for dx in ti.static([-1, 0, 1]):
-            for dy in ti.static([-1, 0, 1]):
-                for dz in ti.static([-1, 0, 1]):
-                    # Neighbor cell coordinate
-                    nc = my_cell + ti.Vector([dx, dy, dz])
-                    
-                    # Wrap cell indices (PBC-aware)
-                    nc = wrap_cell(nc)
-                    
-                    # Linear index (centralized function)
-                    nc_id = cell_id(nc)
-                    
-                    # Iterate particles in neighbor cell
-                    start = cell_start[nc_id]
-                    count = cell_count[nc_id]
-                    
-                    for k in range(start, start + count):
-                        j = cell_indices[k]
+        # EXPLICIT wrap after calculation (defense against floating-point edge cases)
+        my_cell = wrap_cell(my_cell)
+        
+        # Check (2*reach+1)³ neighboring cells dynamically
+        # Using runtime loops instead of ti.static to avoid unrolling 343 iterations
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for dz in range(-reach, reach + 1):
+                        # Neighbor cell coordinate
+                        nc = my_cell + ti.Vector([dx, dy, dz])
                         
-                        if i != j:
-                            # Minimum-image distance (PBC-aware)
-                            delta = pdelta(pos[i], pos[j])
-                            dist_sq = delta.dot(delta)
+                        # Wrap cell indices (PBC-aware)
+                        # Citation [7] from Perplexity: MUST wrap neighbor cells for PBC
+                        nc = wrap_cell(nc)
+                        
+                        # Linear index (centralized function)
+                        nc_id = cell_id(nc)
+                        
+                        # Iterate particles in neighbor cell
+                        start = cell_start[nc_id]
+                        count = cell_count[nc_id]
+                        
+                        for k in range(start, start + count):
+                            j = cell_indices[k]
                             
-                            # Contact threshold: touching + tolerance (matches PBD gap)
-                            touch_thresh = (1.0 + CONTACT_TOL) * (rad[i] + rad[j])
-                            
-                            if dist_sq <= touch_thresh * touch_thresh:
-                                deg[i] += 1
+                            if i != j:
+                                # Minimum-image distance (PBC-aware)
+                                delta = pdelta(pos[i], pos[j])
+                                dist_sq = delta.dot(delta)
+                                
+                                # Contact threshold: touching + tolerance (matches PBD gap)
+                                touch_thresh = (1.0 + CONTACT_TOL) * (rad[i] + rad[j])
+                                
+                                if dist_sq <= touch_thresh * touch_thresh:
+                                    deg[i] += 1
 
 
 # ==============================================================================
@@ -388,4 +412,126 @@ def update_colors(deg: ti.template(), color: ti.template(), n: ti.i32, deg_low: 
         else:
             # Blue: above target band (needs to shrink)
             color[i] = ti.Vector([0.2, 0.5, 1.0])
+
+
+# ==============================================================================
+# Validation: Grid accuracy check (brute-force comparison)
+# ==============================================================================
+
+@ti.kernel
+def validate_grid_neighbors(pos: ti.template(), rad: ti.template(), 
+                            deg_grid: ti.template(), deg_brute: ti.template(),
+                            cell_start: ti.template(), cell_count: ti.template(),
+                            cell_indices: ti.template(), 
+                            sample_indices: ti.template(), n_samples: ti.i32, active_n: ti.i32):
+    """
+    Validate grid-based neighbor counting against brute-force for a sample of particles.
+    
+    For each particle in sample_indices:
+      - deg_grid[i]: already computed via count_neighbors (uses 27-cell stencil)
+      - deg_brute[i]: computed here via brute force (checks ONLY active_n particles)
+    
+    This is O(n_samples × active_n), so only run on small samples (~200 particles).
+    
+    CRITICAL: Must iterate only over active_n particles, not the entire allocated field size!
+    """
+    for idx in range(n_samples):
+        i = sample_indices[idx]
+        
+        # Brute-force neighbor count (check all ACTIVE particles only)
+        brute_count = 0
+        
+        for j in range(active_n):
+            if i != j:
+                # Minimum-image distance (PBC-aware)
+                delta = pdelta(pos[i], pos[j])
+                dist_sq = delta.dot(delta)
+                
+                # Contact threshold: touching + tolerance
+                touch_thresh = (1.0 + CONTACT_TOL) * (rad[i] + rad[j])
+                
+                if dist_sq <= touch_thresh * touch_thresh:
+                    brute_count += 1
+        
+        deg_brute[i] = brute_count
+
+
+# ==============================================================================
+# Diagnostic: Stencil iteration counter
+# ==============================================================================
+
+@ti.kernel
+def count_stencil_iterations(reach: ti.i32) -> ti.i32:
+    """
+    Diagnostic kernel: Count how many cells are actually checked in the stencil loops.
+    
+    Returns the total number of (dx, dy, dz) iterations executed.
+    Expected: (2*reach+1)³
+    
+    If this returns 27 when reach=3, the loops are NOT using dynamic reach!
+    """
+    total = 0
+    for dx in range(-reach, reach + 1):
+        for dy in range(-reach, reach + 1):
+            for dz in range(-reach, reach + 1):
+                total += 1
+    return total
+
+
+def validate_neighbor_counts(pos, rad, deg_grid, cell_start, cell_count, cell_indices, active_n):
+    """
+    Python wrapper: Validate grid-based neighbor counting.
+    
+    Samples ~200 random particles, compares grid vs brute-force neighbor counts.
+    Prints diagnostic info to console (no performance impact when not called).
+    """
+    import numpy as np
+    
+    # Sample size (balance accuracy vs performance)
+    n_samples = min(200, active_n)
+    
+    # Pick random particles to validate
+    sample_indices_np = np.random.choice(active_n, size=n_samples, replace=False).astype(np.int32)
+    sample_indices = ti.field(dtype=ti.i32, shape=n_samples)
+    sample_indices.from_numpy(sample_indices_np)
+    
+    # Allocate brute-force degree array
+    deg_brute = ti.field(dtype=ti.i32, shape=pos.shape[0])
+    
+    # Run brute-force validation kernel
+    # CRITICAL: Pass active_n so brute-force only checks active particles, not entire field
+    validate_grid_neighbors(pos, rad, deg_grid, deg_brute, 
+                           cell_start, cell_count, cell_indices,
+                           sample_indices, n_samples, active_n)
+    
+    # Extract results
+    grid_deg_np = deg_grid.to_numpy()[sample_indices_np]
+    brute_deg_np = deg_brute.to_numpy()[sample_indices_np]
+    
+    # Compute statistics
+    diff = brute_deg_np - grid_deg_np  # Positive = grid missed neighbors
+    total_neighbors = brute_deg_np.sum()
+    missed_neighbors = np.maximum(diff, 0).sum()  # Only count misses, not extra
+    miss_rate_pct = 100.0 * missed_neighbors / max(1, total_neighbors)
+    
+    mean_grid = grid_deg_np.mean()
+    mean_brute = brute_deg_np.mean()
+    mean_err = mean_brute - mean_grid
+    
+    max_diff = np.abs(diff).max()
+    
+    # Print validation report
+    print(f"[Grid Check] sampled {n_samples}/{active_n} particles")
+    print(f"             grid_deg: μ={mean_grid:.2f} [{grid_deg_np.min()},{grid_deg_np.max()}]")
+    print(f"             brute_deg: μ={mean_brute:.2f} [{brute_deg_np.min()},{brute_deg_np.max()}]")
+    print(f"             missed: {missed_neighbors}/{total_neighbors} neighbors ({miss_rate_pct:.1f}%)")
+    print(f"             max |error|: {max_diff} | mean_err: {mean_err:+.2f}")
+    
+    # Pass/fail threshold
+    if miss_rate_pct < 1.0:
+        print(f"             ✓ PASS (miss_rate < 1.0%)")
+    else:
+        print(f"             ⚠️  FAIL - Grid too coarse or stencil incomplete")
+    
+    return miss_rate_pct
 
