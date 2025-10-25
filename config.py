@@ -37,15 +37,6 @@ CELL_SIZE_OVERRIDE = None
 R_MIN_MANUAL = 0.0005       # Minimum particle radius
 R_MAX_MANUAL = 0.0500       # Maximum particle radius (100x larger than min)
 
-# ==============================================================================
-# Runtime Box Scaling (GUI controls)
-# ==============================================================================
-
-AUTO_BOX_SCALING_DEFAULT = False    # Default to MANUAL box scaling
-PHI_TARGET_DEFAULT = 0.30           # Default packing fraction for auto mode
-RREF_TARGET_DEFAULT = 0.0040        # Default reference radius for auto mode
-DOMAIN_SIZE_DEFAULT = 0.15          # Default manual box side length
-
 # Periodic Boundary Conditions (PBC)
 PBC_ENABLED = True          # Toggle periodic boundaries (compile-time via ti.static)
                             # True: particles wrap at domain edges (toroidal topology)
