@@ -931,3 +931,135 @@ def gather_filtered_to_render(
         rad_render[i] = 0.0
         col_render[i] = ti.Vector([0.0, 0.0, 0.0])
 
+
+# ==============================================================================
+# Decision Logic (hysteresis + streak locking)
+# ==============================================================================
+
+@ti.kernel
+def decide_action(
+    deg_s: ti.template(),           # deg_smoothed (f32)
+    action: ti.template(),          # i32
+    lock_pulses: ti.template(),     # i32
+    streak: ti.template(),          # i32
+    n: ti.i32,
+    deg_low: ti.f32,
+    deg_high: ti.f32,
+    hysteresis: ti.f32,
+    streak_lock: ti.i32
+):
+    """
+    Decide per-particle action (grow/shrink/hold) with hysteresis + streak locking.
+    
+    Hysteresis prevents flip-flop at band boundaries:
+    - Grow starts below (deg_low - hysteresis), stops above (deg_low + hysteresis)
+    - Shrink starts above (deg_high + hysteresis), stops below (deg_high - hysteresis)
+    
+    Streak locking keeps a decision for `streak_lock` pulses once made,
+    enabling sustained multi-pulse runs (e.g., grow ×5).
+    
+    Args:
+        deg_s: smoothed degree field (EMA)
+        action: output action field (-1=shrink, 0=hold, +1=grow)
+        lock_pulses: countdown to unlock (int)
+        streak: signed streak accumulator (grows on grow, shrinks on shrink, decays on hold)
+        n: number of active particles
+        deg_low, deg_high: target degree band
+        hysteresis: band padding to prevent chattering
+        streak_lock: pulses to lock a decision once made
+    """
+    # Compute decision thresholds with hysteresis
+    grow_start = deg_low - hysteresis
+    grow_stop = deg_low + hysteresis
+    shrink_start = deg_high + hysteresis
+    shrink_stop = deg_high - hysteresis
+    
+    for i in range(n):
+        if lock_pulses[i] > 0:
+            # Keep previous action; decrement lock counter
+            lock_pulses[i] -= 1
+        else:
+            # Make new decision based on degree
+            a = 0
+            d = deg_s[i]
+            if d < grow_start:
+                a = 1
+            elif d > shrink_start:
+                a = -1
+            else:
+                a = 0
+            
+            action[i] = a
+            
+            # Lock decision if non-zero (grow or shrink)
+            if a != 0:
+                lock_pulses[i] = streak_lock
+        
+        # Update streak counter (momentum source)
+        # Grows on grow, shrinks on shrink, decays toward 0 on hold
+        if action[i] > 0:
+            streak[i] = ti.min(streak[i] + 1, 32767)  # Cap at max int16
+        elif action[i] < 0:
+            streak[i] = ti.max(streak[i] - 1, -32768)  # Cap at min int16
+        else:
+            # Decay toward 0 during hold
+            if streak[i] > 0:
+                streak[i] -= 1
+            elif streak[i] < 0:
+                streak[i] += 1
+
+
+@ti.kernel
+def update_radii_with_actions(
+    rad: ti.template(),
+    action: ti.template(),      # -1, 0, +1
+    streak: ti.template(),      # signed
+    n: ti.i32,
+    base_rate: ti.f32,          # grow_rate_rt[None]
+    rate_limit: ti.f32,         # max per pulse, runtime
+    rmin: ti.f32,
+    rmax: ti.f32,
+    momentum: ti.f32,           # MOMENTUM (0.0 = disabled)
+    streak_cap: ti.i32
+):
+    """
+    Update radii based on per-particle actions with optional momentum.
+    
+    Applies geometric growth/shrink: r_new = r_old * (1 + effective_rate)
+    effective_rate = base_rate * (1 + momentum * min(|streak|, streak_cap))
+    
+    Enables sustained exponential compounding during multi-pulse streaks.
+    
+    Args:
+        rad: particle radii
+        action: per-particle decision (-1=shrink, 0=hold, +1=grow)
+        streak: signed streak counter (for momentum)
+        n: number of active particles
+        base_rate: base growth/shrink rate per pulse
+        rate_limit: max rate per pulse (runtime safety clamp)
+        rmin, rmax: hard radius bounds
+        momentum: momentum gain per streak unit (0.0 = disabled)
+        streak_cap: max streak for momentum calculation
+    """
+    for i in range(n):
+        a = action[i]
+        if a == 0:
+            continue  # Hold: no change
+        
+        # Compute momentum gain (optional)
+        s_abs = ti.cast(ti.abs(streak[i]), ti.f32)
+        s_abs = ti.min(s_abs, ti.cast(streak_cap, ti.f32))
+        gain = base_rate * (1.0 + momentum * s_abs)
+        
+        # Apply action sign, clamp to rate_limit
+        eff = ti.min(gain, rate_limit)
+        eff = eff * ti.cast(a, ti.f32)
+        
+        # Geometric update: r_new = r_old * (1 + eff)
+        r_old = rad[i]
+        r_new = r_old * (1.0 + eff)
+        
+        # Clamp to hard bounds
+        r_new = ti.max(rmin, ti.min(rmax, r_new))
+        rad[i] = r_new
+

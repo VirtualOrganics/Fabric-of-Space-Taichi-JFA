@@ -19,8 +19,32 @@ import math
 
 N = 5000                    # Total number of particles (target mean degree ~5-6)
 DOMAIN_SIZE = 0.15          # Cubic domain side length [0, 0.15)³ (reduced density for PBD breathing room)
-R_MIN = 0.0020              # Minimum radius (hard lower bound) - 4x spread
-R_MAX = 0.0080              # Maximum radius (hard upper bound) - 4x spread
+
+# ==============================================================================
+# Density-based radius auto-scaling (keeps look consistent across N)
+# ==============================================================================
+
+AUTO_SCALE_RADII = False    # If True, compute R_MIN/R_MAX from N and φ at startup (MANUAL by default)
+PHI_TARGET = 0.30           # Target packing fraction (0.10=loose foam, 0.60=dense)
+R_MIN_FACTOR = 0.1          # r_min = R_MIN_FACTOR * r_ref (10x smaller than ref)
+R_MAX_FACTOR = 10.0         # r_max = R_MAX_FACTOR * r_ref (10x larger than ref)
+                            # Spread = R_MAX_FACTOR / R_MIN_FACTOR = 100x
+
+# Grid cell size override (None = auto-compute from r_max, or set manually e.g. 0.01)
+CELL_SIZE_OVERRIDE = None
+
+# Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
+R_MIN_MANUAL = 5e-4         # 0.0005
+R_MAX_MANUAL = 5e-2         # 0.050
+
+# ==============================================================================
+# Runtime Box Scaling (GUI controls)
+# ==============================================================================
+
+AUTO_BOX_SCALING_DEFAULT = False    # Default to MANUAL box scaling
+PHI_TARGET_DEFAULT = 0.30           # Default packing fraction for auto mode
+RREF_TARGET_DEFAULT = 0.0040        # Default reference radius for auto mode
+DOMAIN_SIZE_DEFAULT = 0.15          # Default manual box side length
 
 # Periodic Boundary Conditions (PBC)
 PBC_ENABLED = True          # Toggle periodic boundaries (compile-time via ti.static)
@@ -32,15 +56,74 @@ HALF_L = 0.5 * DOMAIN_SIZE  # Half domain size for centered coordinates
 INV_L = 1.0 / DOMAIN_SIZE   # Inverse domain size (avoid repeated division)
 
 # ==============================================================================
+# Helper: Compute radius bounds from packing fraction
+# ==============================================================================
+
+def compute_radius_bounds(N, phi_target, domain_size, r_min_factor, r_max_factor):
+    """
+    Compute reference radius and bounds from target packing fraction.
+    
+    Formula: r_ref = ((3 φ V_box) / (4π N))^(1/3)
+    
+    Args:
+        N: particle count
+        phi_target: target packing fraction (0.1–0.6)
+        domain_size: cubic domain side length
+        r_min_factor, r_max_factor: multipliers around r_ref
+    
+    Returns:
+        (r_ref, r_min, r_max, suggested_cell_size)
+    """
+    V_box = domain_size ** 3
+    r_ref = ((3.0 * phi_target * V_box) / (4.0 * math.pi * max(N, 1))) ** (1.0 / 3.0)
+    
+    r_min = r_min_factor * r_ref
+    r_max = r_max_factor * r_ref
+    
+    # Suggest cell size: ~2× r_max with buffer (for 27-stencil neighbor search)
+    suggested_cell_size = 2.2 * r_max
+    
+    return r_ref, r_min, r_max, suggested_cell_size
+
+# ==============================================================================
+# Apply auto-scaling (or use manual bounds)
+# ==============================================================================
+
+if AUTO_SCALE_RADII:
+    R_REF, R_MIN, R_MAX, SUGGESTED_CELL_SIZE = compute_radius_bounds(
+        N, PHI_TARGET, DOMAIN_SIZE, R_MIN_FACTOR, R_MAX_FACTOR
+    )
+    
+    # Use override if provided, otherwise use suggested cell size
+    if CELL_SIZE_OVERRIDE is None:
+        CELL_SIZE = SUGGESTED_CELL_SIZE
+    else:
+        CELL_SIZE = CELL_SIZE_OVERRIDE
+    
+    # Startup telemetry (shows computed values)
+    print(f"[Auto-Scale] N={N}, φ={PHI_TARGET:.2f} → r_ref={R_REF:.6f}, "
+          f"R∈[{R_MIN:.6f}, {R_MAX:.6f}] (spread×{R_MAX/R_MIN:.1f})")
+    print(f"[Auto-Scale] CELL_SIZE={CELL_SIZE:.6f} (override={CELL_SIZE_OVERRIDE is not None})")
+else:
+    # Use manual bounds
+    R_MIN = R_MIN_MANUAL
+    R_MAX = R_MAX_MANUAL
+    CELL_SIZE = 2.0 * R_MAX  # Conservative default
+    R_REF = None  # Not computed
+    print(f"[Manual] R∈[{R_MIN:.6f}, {R_MAX:.6f}], CELL_SIZE={CELL_SIZE:.6f}")
+
+# ==============================================================================
 # Grid parameters (spatial hashing for neighbor search)
 # ==============================================================================
 
-CELL_SIZE = 2 * R_MAX       # Conservative cell size = 0.016 (updated for new R_MAX)
-                            # Any pair in adjacent cells can potentially touch
-
 # Grid resolution: ceil ensures last cell covers box edge, max(3,...) ensures
 # 27-stencil is always valid (no edge cases with 1x1x1 or 2x2x2 grids)
-GRID_RES = max(3, int(math.ceil(DOMAIN_SIZE / CELL_SIZE)))  # = 13 cells per axis
+GRID_RES = max(3, int(math.ceil(DOMAIN_SIZE / CELL_SIZE)))
+
+# Safety check: warn if r_max is too large vs cell size
+if R_MAX > 0.5 * CELL_SIZE:
+    print(f"[Auto-Scale][WARN] R_MAX ({R_MAX:.6f}) > 0.5×CELL_SIZE ({CELL_SIZE:.6f}). "
+          f"Consider increasing CELL_SIZE or GRID_RES for efficiency.")
 
 CONTACT_TOL = 0.015         # Contact tolerance: 1.5% beyond touching
                             # Matches PBD GAP_FRACTION. Particles at (1+TOL)*(r_i+r_j) 
@@ -216,6 +299,20 @@ MAX_DRIFT_FRACTION = 0.20       # Cap per-step drift to 20% of GAP
 GROWTH_RATE_DEFAULT = 0.04      # 4% per pulse (both grow and shrink)
 GROWTH_INTERVAL_DEFAULT = 20    # Frames between pulses
 RELAX_INTERVAL_DEFAULT = 10     # Relax frames after a pulse (PBD + Lévy only)
+
+# ==============================================================================
+# Decision Stability (hysteresis + streaks)
+# ==============================================================================
+# Prevents decision flip-flop on noise, enabling sustained growth/shrink runs.
+
+HYSTERESIS = 0.6                # Degree units added around band edges
+                                # Prevents chattering when deg ~ DEG_LOW or DEG_HIGH
+STREAK_LOCK = 3                 # Pulses to keep a decision before reconsidering
+                                # Enables multi-pulse growth/shrink runs (e.g., grow ×5)
+MOMENTUM = 0.0                  # Streak momentum (0.10 = 10% gain per streak unit)
+                                # Start at 0.0 (disabled), tune upward for compounding
+STREAK_CAP = 4                  # Cap for momentum amplification
+                                # Limits exponential explosion from long streaks
 
 # ==============================================================================
 # Lévy Positional Diffusion (Track 2: topological regularization)

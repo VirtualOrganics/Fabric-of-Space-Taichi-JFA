@@ -37,8 +37,20 @@ from config import (
     # Lévy Positional Diffusion (Track 2: topological regularization)
     LEVY_ENABLED, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC, LEVY_USE_TOPO_DEG,
     # Growth/Relax Rhythm (defaults only; runtime uses Taichi fields)
-    GROWTH_RATE_DEFAULT, GROWTH_INTERVAL_DEFAULT, RELAX_INTERVAL_DEFAULT
+    GROWTH_RATE_DEFAULT, GROWTH_INTERVAL_DEFAULT, RELAX_INTERVAL_DEFAULT,
+    # Decision Stability (hysteresis + streaks)
+    HYSTERESIS, STREAK_LOCK, MOMENTUM, STREAK_CAP,
+    # Auto-scaling (startup)
+    AUTO_SCALE_RADII, PHI_TARGET,
+    # Runtime box scaling
+    AUTO_BOX_SCALING_DEFAULT, PHI_TARGET_DEFAULT, RREF_TARGET_DEFAULT, DOMAIN_SIZE_DEFAULT
 )
+
+# Import R_REF if auto-scaling is enabled
+try:
+    from config import R_REF
+except ImportError:
+    R_REF = None  # Not available when AUTO_SCALE_RADII = False
 from grid import (
     clear_grid, clear_all_particles, count_particles_per_cell, prefix_sum, copy_cell_pointers,
     scatter_particles, count_neighbors, update_colors,
@@ -50,7 +62,8 @@ from dynamics import (
     update_radii_xpbd, apply_xsph_smoothing,
     init_jitter_velocities, apply_brownian, integrate_jitter,
     compute_mean_radius, smooth_degree, levy_position_diffusion,
-    update_colors_by_size, filter_write_indices, gather_filtered_to_render
+    update_colors_by_size, filter_write_indices, gather_filtered_to_render,
+    decide_action, update_radii_with_actions
 )
 
 # Phase B: Topological neighbor counting
@@ -91,6 +104,11 @@ pos_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER)  # Filtered posi
 rad_render = ti.field(dtype=ti.f32, shape=MAX_RENDER)            # Filtered radii
 col_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER)  # Filtered colors
 
+# Per-particle decision state (for hysteresis + streak locking)
+action = ti.field(dtype=ti.i32, shape=MAX_N)        # -1=shrink, 0=hold, +1=grow
+lock_pulses = ti.field(dtype=ti.i32, shape=MAX_N)   # Countdown to unlock decision
+streak = ti.field(dtype=ti.i32, shape=MAX_N)        # Signed streak accumulator (momentum source)
+
 # Brownian motion (OU jitter velocities)
 v_jit = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)   # Jitter velocities (OU process)
 mean_radius = ti.field(dtype=ti.f32, shape=())           # Scalar: mean radius (for jitter scaling)
@@ -112,6 +130,12 @@ viz_dim_alpha_rt = ti.field(dtype=ti.f32, shape=())      # Dim factor for out-of
 
 # Debug mode for filter testing (0=Normal, 1=ALL, 2=EVERY_OTHER, 3=MIDDLE_THIRD)
 VIZ_FILTER_FORCE_MODE = ti.field(dtype=ti.i32, shape=())
+
+# Runtime box scaling controls
+auto_box_scaling = ti.field(dtype=ti.i32, shape=())   # 0=Manual, 1=Auto
+phi_target_rt = ti.field(dtype=ti.f32, shape=())      # Target packing fraction (auto mode)
+rref_target_rt = ti.field(dtype=ti.f32, shape=())     # Target reference radius (auto mode)
+domain_size_rt = ti.field(dtype=ti.f32, shape=())     # Manual box side length
 
 # Grid data
 cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
@@ -157,6 +181,81 @@ def init_visual_runtime():
     viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band
     VIZ_FILTER_FORCE_MODE[None] = 0  # Start with normal filter
 
+def init_box_scaling_runtime():
+    """Initialize box scaling runtime fields from config defaults."""
+    auto_box_scaling[None] = int(AUTO_BOX_SCALING_DEFAULT)
+    phi_target_rt[None] = PHI_TARGET_DEFAULT
+    rref_target_rt[None] = RREF_TARGET_DEFAULT
+    domain_size_rt[None] = DOMAIN_SIZE
+
+@ti.kernel
+def init_decision_fields(n: ti.i32):
+    """Initialize per-particle decision fields (action, lock_pulses, streak) to zero."""
+    for i in range(n):
+        action[i] = 0       # Start with hold
+        lock_pulses[i] = 0  # No lock
+        streak[i] = 0       # No streak
+
+# ==============================================================================
+# Box Scaling Helpers
+# ==============================================================================
+
+def suggest_cell_size(r_max):
+    """Suggest grid cell size from max radius (keep neighbor search tight)."""
+    return 2.2 * r_max
+
+def grid_from_box_and_rmax(L, r_max):
+    """Compute cell size and grid resolution from box size and max radius."""
+    cell = suggest_cell_size(r_max)
+    res = max(4, int(math.ceil(L / cell)))
+    return cell, res
+
+def compute_L_lock_rref(N, phi, r_ref):
+    """
+    Compute box side length L to fit N particles at packing fraction φ
+    with fixed reference radius r_ref.
+    
+    Formula: V = (4π/3) * N * r_ref³ / φ, then L = V^(1/3)
+    """
+    V = (4.0 * math.pi / 3.0) * N * (r_ref ** 3) / phi
+    return V ** (1.0 / 3.0)
+
+def apply_manual_box(L):
+    """
+    Apply manual box size (user-specified L).
+    Updates domain constants but does NOT reallocate fields (not supported at runtime).
+    User must restart with new config values for actual resize.
+    """
+    global DOMAIN_SIZE
+    
+    # Note: We can't actually resize Taichi fields at runtime
+    # This function updates the value for display/planning, but requires restart
+    print(f"[Box][Manual] Requested L={L:.6f}")
+    print(f"[Box][Manual] ⚠️  Box resize requires RESTART")
+    print(f"[Box][Manual] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
+    
+    # Show what grid params would be
+    r_max = float(gui_r_max)
+    cell, res = grid_from_box_and_rmax(L, r_max)
+    print(f"[Box][Manual] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+
+def apply_auto_box(N, phi, r_ref):
+    """
+    Apply auto box scaling (keep r_ref, grow box to maintain φ).
+    Updates domain constants but does NOT reallocate fields (not supported at runtime).
+    User must restart with new config values for actual resize.
+    """
+    L = compute_L_lock_rref(N, phi, r_ref)
+    
+    print(f"[Box][Auto] N={N}, φ={phi:.2f}, r_ref={r_ref:.6f} → L={L:.6f}")
+    print(f"[Box][Auto] ⚠️  Box resize requires RESTART")
+    print(f"[Box][Auto] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
+    
+    # Show what grid params would be
+    r_max = float(gui_r_max)
+    cell, res = grid_from_box_and_rmax(L, r_max)
+    print(f"[Box][Auto] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
     """Wrap seeded positions into PBC primary cell (always-wrapped invariant)."""
@@ -171,7 +270,7 @@ def seed_particles(n):
         n: Number of particles to seed
     
     Positions: Uniform random in [-L/2, L/2)³ if PBC, else [0, DOMAIN_SIZE)³
-    Radii: Uniform random in [R_MIN, R_MAX]
+    Radii: Log-normal around R_REF (if auto-scaling), else uniform in [R_MIN, R_MAX]
     
     After seeding, positions are wrapped to maintain always-wrapped invariant.
     """
@@ -183,7 +282,21 @@ def seed_particles(n):
         # Seed in bounded domain [0, DOMAIN_SIZE)³
         pos_np = np.random.uniform(0, DOMAIN_SIZE, (n, 3)).astype(np.float32)
     
-    rad_np = np.random.uniform(R_MIN, R_MAX, n).astype(np.float32)
+    # Seed radii around r_ref (log-normal) or uniformly in [R_MIN, R_MAX]
+    if AUTO_SCALE_RADII and R_REF is not None:
+        # Log-normal distribution: r = r_ref * exp(σ * randn())
+        # Small jitter (~5% sigma) keeps particles near r_ref initially
+        jitter_sigma = 0.05
+        rad_np = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            g = np.random.normal(0.0, jitter_sigma)
+            r = R_REF * np.exp(g)
+            rad_np[i] = np.clip(r, R_MIN, R_MAX)
+        print(f"[Init] Seeded radii: log-normal around r_ref={R_REF:.6f} (σ={jitter_sigma})")
+    else:
+        # Uniform distribution in [R_MIN, R_MAX]
+        rad_np = np.random.uniform(R_MIN, R_MAX, n).astype(np.float32)
+        print(f"[Init] Seeded radii: uniform in [{R_MIN:.6f}, {R_MAX:.6f}]")
     
     # Only write to the first n elements
     for i in range(n):
@@ -261,6 +374,12 @@ def initialize_simulation(n):
     
     # Initialize visualization settings
     init_visual_runtime()
+    
+    # Initialize box scaling settings
+    init_box_scaling_runtime()
+    
+    # Initialize decision fields (action, lock_pulses, streak)
+    init_decision_fields(n)
     
     # Warmup PBD
     warmup_pbd(n)
@@ -471,51 +590,79 @@ while window.running:
         
         # === 8. PULSE gate: measure + ONE discrete growth step, then schedule relax ===
         if pulse_timer[None] <= 0:
-            # 8A. Measure with current geometry
+            # 8A. Count neighbors and smooth degree (EMA, only on pulse frames)
             count_neighbors(pos, rad, deg, cell_start, cell_count, cell_indices, active_n)
+            smooth_degree(deg, deg_smoothed, active_n, 0.25)  # Smooth signal before decision
             
-            # Store radius stats BEFORE pulse (for telemetry)
+            # 8B. Decide per-particle actions with hysteresis + streak locking
+            deg_low_target = float(TOPO_DEG_LOW if TOPO_ENABLED else gui_deg_low)
+            deg_high_target = float(TOPO_DEG_HIGH if TOPO_ENABLED else gui_deg_high)
+            
+            decide_action(
+                deg_smoothed, action, lock_pulses, streak, active_n,
+                deg_low_target, deg_high_target,
+                float(HYSTERESIS), int(STREAK_LOCK)
+            )
+            
+            # 8C. Store stats BEFORE radius update (for telemetry)
             rad_np_before = rad.to_numpy()[:active_n]
             deg_np_before = deg.to_numpy()[:active_n]
-            r_mean_before = rad_np_before.mean()
-            deg_mean_before = deg_np_before.mean()
+            act_np = action.to_numpy()[:active_n]
+            str_np = streak.to_numpy()[:active_n]
+            r_mean_before = float(rad_np_before.mean())
+            deg_mean_before = float(deg_np_before.mean())
             
-            # 8B. One discrete growth/shrink step (±grow_rate_rt)
-            deg_low_target = TOPO_DEG_LOW if TOPO_ENABLED else gui_deg_low
-            deg_high_target = TOPO_DEG_HIGH if TOPO_ENABLED else gui_deg_high
-            
+            # 8D. Apply per-particle actions with optional momentum
             # Auto-enforce: rate limit >= growth rate (so pulse is visible)
             from config import RADIUS_RATE_LIMIT
             rate_limit_rt = max(RADIUS_RATE_LIMIT, float(grow_rate_rt[None]))
             
-            # Apply pulse with runtime rate limit
-            update_radii_xpbd(rad, deg, active_n, DT, gui_r_min, gui_r_max, 
-                             deg_low_target, deg_high_target, 
-                             grow_rate_rt[None], grow_rate_rt[None], rate_limit_rt)
+            update_radii_with_actions(
+                rad, action, streak, active_n,
+                float(grow_rate_rt[None]),
+                float(rate_limit_rt),
+                float(gui_r_min), float(gui_r_max),
+                float(MOMENTUM), int(STREAK_CAP)
+            )
             
-            # Store radius stats AFTER pulse (for telemetry)
+            # 8E. Store stats AFTER radius update
             rad_np_after = rad.to_numpy()[:active_n]
-            r_mean_after = rad_np_after.mean()
+            r_mean_after = float(rad_np_after.mean())
             
             # Count how many radii hit bounds (clipped)
-            clipped_min = np.sum(rad_np_after <= gui_r_min + 1e-6)
-            clipped_max = np.sum(rad_np_after >= gui_r_max - 1e-6)
+            clipped_min = int(np.sum(rad_np_after <= gui_r_min + 1e-6))
+            clipped_max = int(np.sum(rad_np_after >= gui_r_max - 1e-6))
             clipped_total = clipped_min + clipped_max
             clipped_pct = 100.0 * clipped_total / active_n if active_n > 0 else 0.0
             
-            # 8C. Schedule relax window and next pulse
+            # 8F. Action counts (grow/shrink/hold)
+            grow_cnt = int((act_np == 1).sum())
+            shrink_cnt = int((act_np == -1).sum())
+            hold_cnt = int((act_np == 0).sum())
+            
+            # 8G. Streak statistics (separate by sign)
+            g_streaks = str_np[act_np == 1]
+            s_streaks = -str_np[act_np == -1]  # Negate shrink streaks for positive values
+            g_mu = float(g_streaks.mean()) if g_streaks.size > 0 else 0.0
+            s_mu = float(s_streaks.mean()) if s_streaks.size > 0 else 0.0
+            g_p95 = float(np.percentile(g_streaks, 95)) if g_streaks.size > 0 else 0.0
+            s_p95 = float(np.percentile(s_streaks, 95)) if s_streaks.size > 0 else 0.0
+            
+            # 8H. Schedule relax window and next pulse
             relax_timer[None] = relax_interval_rt[None]
             pulse_timer[None] = grow_interval_rt[None]
             
-            # 8D. Enhanced telemetry (every pulse, with before/after stats)
+            # 8I. Enhanced telemetry (every pulse, with streak stats)
             delta_r_mean = r_mean_after - r_mean_before
             delta_r_pct = 100.0 * delta_r_mean / r_mean_before if r_mean_before > 0 else 0.0
             
             print(f"[Pulse] frame={frame:4d} | rate={grow_rate_rt[None]:.3f} gap={grow_interval_rt[None]} relax={relax_interval_rt[None]}")
+            print(f"        action: grow={grow_cnt} shrink={shrink_cnt} hold={hold_cnt}")
+            print(f"        streak: grow μ={g_mu:.2f} p95={g_p95:.0f} | shrink μ={s_mu:.2f} p95={s_p95:.0f}")
             print(f"        deg: μ={deg_mean_before:.2f} [{deg_np_before.min()},{deg_np_before.max()}]")
             print(f"        r_mean: {r_mean_before:.6f} → {r_mean_after:.6f} (Δ={delta_r_mean:+.6f}, {delta_r_pct:+.2f}%)")
             print(f"        clipped: {clipped_total}/{active_n} ({clipped_pct:.1f}%) [min={clipped_min} max={clipped_max}]")
-            print(f"        max_depth={max_depth:.6f}, passes={passes_needed}")
+            print(f"        depth={max_depth:.6f} passes={passes_needed}")
         else:
             pulse_timer[None] -= 1
         
@@ -834,6 +981,60 @@ while window.running:
             dim = viz_dim_alpha_rt[None]
             dim = window.GUI.slider_float("Dim level", dim, 0.0, 0.5)
             viz_dim_alpha_rt[None] = dim
+    
+    window.GUI.text("")
+    
+    # === Box Scaling ===
+    window.GUI.text(f"=== Box Scaling ===")
+    window.GUI.text(f"Current: L={DOMAIN_SIZE:.4f}, N={active_n}")
+    
+    # Auto/Manual toggle
+    auto_toggle = auto_box_scaling[None] == 1
+    auto_toggle = window.GUI.checkbox("Auto box scaling", auto_toggle)
+    auto_box_scaling[None] = 1 if auto_toggle else 0
+    
+    if auto_box_scaling[None] == 0:
+        # MANUAL MODE
+        window.GUI.text("(Manual: adjust L, press Apply)")
+        L = domain_size_rt[None]
+        L = window.GUI.slider_float("Box side L", L, 0.05, 1.00)
+        domain_size_rt[None] = L
+        
+        # Preview grid params
+        r_max_preview = gui_r_max
+        cell_preview, res_preview = grid_from_box_and_rmax(L, r_max_preview)
+        window.GUI.text(f"  Preview: CELL={cell_preview:.5f}, GRID_RES={res_preview}")
+        
+        if window.GUI.button("Apply (Manual)"):
+            apply_manual_box(domain_size_rt[None])
+    else:
+        # AUTO MODE (correction formula)
+        window.GUI.text("(Auto: keep r_ref, grow box)")
+        
+        phi = phi_target_rt[None]
+        rref = rref_target_rt[None]
+        
+        phi = window.GUI.slider_float("Target φ", phi, 0.10, 0.60)
+        rref = window.GUI.slider_float("Target r_ref", rref, 0.0005, 0.0100)
+        
+        phi_target_rt[None] = phi
+        rref_target_rt[None] = rref
+        
+        # Preview computed values
+        L_preview = compute_L_lock_rref(active_n, phi, rref)
+        r_max_preview = gui_r_max
+        cell_preview, res_preview = grid_from_box_and_rmax(L_preview, r_max_preview)
+        
+        window.GUI.text(f"  L={L_preview:.5f}  cell={cell_preview:.5f}  res={res_preview}")
+        
+        if window.GUI.button("Apply (Auto)"):
+            apply_auto_box(active_n, phi, rref)
+    
+    # Grid health check
+    if gui_r_max > 0.5 * CELL_SIZE:
+        window.GUI.text("⚠ Grid too coarse (r_max > 0.5×CELL_SIZE)")
+    elif gui_r_max < 0.1 * CELL_SIZE:
+        window.GUI.text("ℹ Grid finer than needed")
     
     window.GUI.text("")
     show_centers_only = window.GUI.checkbox("Show centers only", show_centers_only)
