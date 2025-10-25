@@ -249,8 +249,11 @@ def write_domain_size_to_config(L):
 def apply_manual_box(L):
     """
     Apply manual box size (user-specified L).
-    Writes DOMAIN_SIZE to config.py automatically.
+    Writes DOMAIN_SIZE to config.py and EXITS to force restart.
     """
+    import sys
+    
+    print(f"\n{'='*60}")
     print(f"[Box][Manual] Requested L={L:.6f}")
     
     # Show what grid params would be
@@ -261,18 +264,25 @@ def apply_manual_box(L):
     if write_domain_size_to_config(L):
         print(f"[Box][Manual] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
         print(f"[Box][Manual] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
-        print(f"[Box][Manual] ⚠️  RESTART required: ./run.sh")
+        print(f"\n🔄 CONFIG UPDATED - EXITING TO APPLY CHANGES")
+        print(f"   Run ./run.sh again to see new box size")
+        print(f"{'='*60}\n")
+        sys.exit(0)
     else:
         print(f"[Box][Manual] ✗ Failed to write config.py (manual edit required)")
         print(f"[Box][Manual] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
+        print(f"{'='*60}\n")
 
 def apply_auto_box(N, phi, r_ref):
     """
     Apply auto box scaling (keep r_ref, grow box to maintain φ).
-    Writes DOMAIN_SIZE to config.py automatically.
+    Writes DOMAIN_SIZE to config.py and EXITS to force restart.
     """
+    import sys
+    
     L = compute_L_lock_rref(N, phi, r_ref)
     
+    print(f"\n{'='*60}")
     print(f"[Box][Auto] N={N}, φ={phi:.2f}, r_ref={r_ref:.6f} → L={L:.6f}")
     
     # Show what grid params would be
@@ -283,10 +293,14 @@ def apply_auto_box(N, phi, r_ref):
     if write_domain_size_to_config(L):
         print(f"[Box][Auto] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
         print(f"[Box][Auto] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
-        print(f"[Box][Auto] ⚠️  RESTART required: ./run.sh")
+        print(f"\n🔄 CONFIG UPDATED - EXITING TO APPLY CHANGES")
+        print(f"   Run ./run.sh again to see new box size")
+        print(f"{'='*60}\n")
+        sys.exit(0)
     else:
         print(f"[Box][Auto] ✗ Failed to write config.py (manual edit required)")
         print(f"[Box][Auto] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
+        print(f"{'='*60}\n")
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
