@@ -221,41 +221,72 @@ def compute_L_lock_rref(N, phi, r_ref):
     V = (4.0 * math.pi / 3.0) * N * (r_ref ** 3) / phi
     return V ** (1.0 / 3.0)
 
+def write_domain_size_to_config(L):
+    """
+    Write DOMAIN_SIZE to config.py automatically.
+    Preserves all other settings.
+    """
+    import re
+    config_path = "config.py"
+    
+    try:
+        with open(config_path, 'r') as f:
+            content = f.read()
+        
+        # Replace DOMAIN_SIZE = <value> line
+        pattern = r'(DOMAIN_SIZE\s*=\s*)[\d.]+(\s*#.*)?'
+        replacement = rf'\g<1>{L:.6f}\2'
+        new_content = re.sub(pattern, replacement, content)
+        
+        with open(config_path, 'w') as f:
+            f.write(new_content)
+        
+        return True
+    except Exception as e:
+        print(f"[Box] ERROR writing to config.py: {e}")
+        return False
+
 def apply_manual_box(L):
     """
     Apply manual box size (user-specified L).
-    Updates domain constants but does NOT reallocate fields (not supported at runtime).
-    User must restart with new config values for actual resize.
+    Writes DOMAIN_SIZE to config.py automatically.
     """
-    global DOMAIN_SIZE
-    
-    # Note: We can't actually resize Taichi fields at runtime
-    # This function updates the value for display/planning, but requires restart
     print(f"[Box][Manual] Requested L={L:.6f}")
-    print(f"[Box][Manual] ⚠️  Box resize requires RESTART")
-    print(f"[Box][Manual] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
     
     # Show what grid params would be
     r_max = float(gui_r_max)
     cell, res = grid_from_box_and_rmax(L, r_max)
-    print(f"[Box][Manual] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+    
+    # Write to config.py
+    if write_domain_size_to_config(L):
+        print(f"[Box][Manual] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
+        print(f"[Box][Manual] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+        print(f"[Box][Manual] ⚠️  RESTART required: ./run.sh")
+    else:
+        print(f"[Box][Manual] ✗ Failed to write config.py (manual edit required)")
+        print(f"[Box][Manual] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
 
 def apply_auto_box(N, phi, r_ref):
     """
     Apply auto box scaling (keep r_ref, grow box to maintain φ).
-    Updates domain constants but does NOT reallocate fields (not supported at runtime).
-    User must restart with new config values for actual resize.
+    Writes DOMAIN_SIZE to config.py automatically.
     """
     L = compute_L_lock_rref(N, phi, r_ref)
     
     print(f"[Box][Auto] N={N}, φ={phi:.2f}, r_ref={r_ref:.6f} → L={L:.6f}")
-    print(f"[Box][Auto] ⚠️  Box resize requires RESTART")
-    print(f"[Box][Auto] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
     
     # Show what grid params would be
     r_max = float(gui_r_max)
     cell, res = grid_from_box_and_rmax(L, r_max)
-    print(f"[Box][Auto] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+    
+    # Write to config.py
+    if write_domain_size_to_config(L):
+        print(f"[Box][Auto] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
+        print(f"[Box][Auto] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
+        print(f"[Box][Auto] ⚠️  RESTART required: ./run.sh")
+    else:
+        print(f"[Box][Auto] ✗ Failed to write config.py (manual edit required)")
+        print(f"[Box][Auto] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
@@ -1011,6 +1042,7 @@ while window.running:
     else:
         # AUTO MODE (correction formula)
         window.GUI.text("(Auto: keep r_ref, grow box)")
+        window.GUI.text(f"Config N={N} (change in config.py)")
         
         phi = phi_target_rt[None]
         rref = rref_target_rt[None]
@@ -1021,15 +1053,15 @@ while window.running:
         phi_target_rt[None] = phi
         rref_target_rt[None] = rref
         
-        # Preview computed values
-        L_preview = compute_L_lock_rref(active_n, phi, rref)
+        # Preview computed values (use config N, not active_n)
+        L_preview = compute_L_lock_rref(N, phi, rref)
         r_max_preview = gui_r_max
         cell_preview, res_preview = grid_from_box_and_rmax(L_preview, r_max_preview)
         
         window.GUI.text(f"  L={L_preview:.5f}  cell={cell_preview:.5f}  res={res_preview}")
         
         if window.GUI.button("Apply (Auto)"):
-            apply_auto_box(active_n, phi, rref)
+            apply_auto_box(N, phi, rref)
     
     # Grid health check
     if gui_r_max > 0.5 * CELL_SIZE:
