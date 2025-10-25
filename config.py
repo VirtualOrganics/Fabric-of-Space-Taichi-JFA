@@ -17,8 +17,8 @@ import math
 # Particle properties
 # ==============================================================================
 
-N = 5000                    # Total number of particles (target mean degree ~5-6)
-DOMAIN_SIZE = 0.15         # Cubic domain side length (SCALE WITH N - see table below)
+N = 25000                    # Total number of particles (target mean degree ~5-6)
+DOMAIN_SIZE = 0.257         # Cubic domain side length (SCALE WITH N - see table below)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCALING TABLE: Match DOMAIN_SIZE to N (keeps same density/degree)
@@ -26,6 +26,7 @@ DOMAIN_SIZE = 0.15         # Cubic domain side length (SCALE WITH N - see table 
 #   N = 5,000   → DOMAIN_SIZE = 0.150
 #   N = 10,000  → DOMAIN_SIZE = 0.189  (2x particles  → 1.26x bigger box)
 #   N = 20,000  → DOMAIN_SIZE = 0.238  (4x particles  → 1.59x bigger box)
+#   N = 25,000  → DOMAIN_SIZE = 0.257  (5x particles  → 1.71x bigger box)
 #   N = 50,000  → DOMAIN_SIZE = 0.324  (10x particles → 2.16x bigger box)
 #
 # Formula: New_Size = 0.15 × (N / 5000)^(1/3)
@@ -45,8 +46,10 @@ R_MAX_FACTOR = 10.0         # r_max = R_MAX_FACTOR * r_ref (10x larger than ref)
 CELL_SIZE_OVERRIDE = None
 
 # Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
-R_MIN_MANUAL = 0.0005       # Minimum particle radius
-R_MAX_MANUAL = 0.0500       # Maximum particle radius (100x larger than min)
+R_MIN_MANUAL = 0.0005       # Minimum particle radius (hard lower bound)
+R_MAX_MANUAL = 0.0500       # Maximum particle radius (hard upper bound - 100x spread)
+R_START_MANUAL = 0.0025     # Starting radius for all particles (uniform seeding)
+                            # System will naturally create size distribution via growth/shrink
 
 # Periodic Boundary Conditions (PBC)
 PBC_ENABLED = True          # Toggle periodic boundaries (compile-time via ti.static)

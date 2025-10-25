@@ -22,7 +22,7 @@ import math  # For box scaling calculations
 
 # Import configuration and kernels
 from config import (
-    N, DOMAIN_SIZE, R_MIN, R_MAX, CELL_SIZE, GRID_RES, VIS_SCALE, FPS_TARGET,
+    N, DOMAIN_SIZE, R_MIN, R_MAX, R_START_MANUAL, CELL_SIZE, GRID_RES, VIS_SCALE, FPS_TARGET,
     PBD_BASE_PASSES, PBD_MAX_PASSES, PBD_ADAPTIVE_SCALE, PBD_SUBSTEPS,
     DEEP_OVERLAP_THRESHOLD, DEEP_OVERLAP_EXIT, FORCE_SUBSTEPS_MIN, FORCE_SUBSTEPS_MAX,
     RESCUE_ENABLED, RESCUE_STRENGTH,
@@ -208,21 +208,11 @@ def seed_particles(n):
         # Seed in bounded domain [0, DOMAIN_SIZE)³
         pos_np = np.random.uniform(0, DOMAIN_SIZE, (n, 3)).astype(np.float32)
     
-    # Seed radii around r_ref (log-normal) or uniformly in [R_MIN, R_MAX]
-    if AUTO_SCALE_RADII and R_REF is not None:
-        # Log-normal distribution: r = r_ref * exp(σ * randn())
-        # Small jitter (~5% sigma) keeps particles near r_ref initially
-        jitter_sigma = 0.05
-        rad_np = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            g = np.random.normal(0.0, jitter_sigma)
-            r = R_REF * np.exp(g)
-            rad_np[i] = np.clip(r, R_MIN, R_MAX)
-        print(f"[Init] Seeded radii: log-normal around r_ref={R_REF:.6f} (σ={jitter_sigma})")
-    else:
-        # Uniform distribution in [R_MIN, R_MAX]
-        rad_np = np.random.uniform(R_MIN, R_MAX, n).astype(np.float32)
-        print(f"[Init] Seeded radii: uniform in [{R_MIN:.6f}, {R_MAX:.6f}]")
+    # Seed all particles with uniform starting radius
+    # Growth/shrink system will naturally create size distribution over time
+    rad_np = np.full(n, R_START_MANUAL, dtype=np.float32)
+    print(f"[Init] Seeded radii: uniform at R_START={R_START_MANUAL:.6f}")
+    print(f"[Init] Bounds: R_MIN={R_MIN:.6f}, R_MAX={R_MAX:.6f} (will evolve naturally)")
     
     # Only write to the first n elements
     for i in range(n):
