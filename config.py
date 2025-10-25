@@ -17,7 +17,7 @@ import math
 # Particle properties
 # ==============================================================================
 
-N = 5000                    # Total number of particles (target mean degree ~5-6)
+N = 20000                    # Total number of particles (target mean degree ~5-6)
 DOMAIN_SIZE = 0.15          # Cubic domain side length [0, 0.15)³ (reduced density for PBD breathing room)
 
 # ==============================================================================
@@ -34,8 +34,8 @@ R_MAX_FACTOR = 10.0         # r_max = R_MAX_FACTOR * r_ref (10x larger than ref)
 CELL_SIZE_OVERRIDE = None
 
 # Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
-R_MIN_MANUAL = 5e-4         # 0.0005
-R_MAX_MANUAL = 5e-2         # 0.050
+R_MIN_MANUAL = 0.0005       # Minimum particle radius
+R_MAX_MANUAL = 0.0500       # Maximum particle radius (100x larger than min)
 
 # ==============================================================================
 # Runtime Box Scaling (GUI controls)

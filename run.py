@@ -42,9 +42,7 @@ from config import (
     # Decision Stability (hysteresis + streaks)
     HYSTERESIS, STREAK_LOCK, MOMENTUM, STREAK_CAP,
     # Auto-scaling (startup)
-    AUTO_SCALE_RADII, PHI_TARGET,
-    # Runtime box scaling
-    AUTO_BOX_SCALING_DEFAULT, PHI_TARGET_DEFAULT, RREF_TARGET_DEFAULT, DOMAIN_SIZE_DEFAULT
+    AUTO_SCALE_RADII, PHI_TARGET
 )
 
 # Import R_REF if auto-scaling is enabled
@@ -132,12 +130,6 @@ viz_dim_alpha_rt = ti.field(dtype=ti.f32, shape=())      # Dim factor for out-of
 # Debug mode for filter testing (0=Normal, 1=ALL, 2=EVERY_OTHER, 3=MIDDLE_THIRD)
 VIZ_FILTER_FORCE_MODE = ti.field(dtype=ti.i32, shape=())
 
-# Runtime box scaling controls
-auto_box_scaling = ti.field(dtype=ti.i32, shape=())   # 0=Manual, 1=Auto
-phi_target_rt = ti.field(dtype=ti.f32, shape=())      # Target packing fraction (auto mode)
-rref_target_rt = ti.field(dtype=ti.f32, shape=())     # Target reference radius (auto mode)
-domain_size_rt = ti.field(dtype=ti.f32, shape=())     # Manual box side length
-
 # Grid data
 cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
 cell_start = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Prefix sum (read-only)
@@ -182,13 +174,6 @@ def init_visual_runtime():
     viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band
     VIZ_FILTER_FORCE_MODE[None] = 0  # Start with normal filter
 
-def init_box_scaling_runtime():
-    """Initialize box scaling runtime fields from config defaults."""
-    auto_box_scaling[None] = int(AUTO_BOX_SCALING_DEFAULT)
-    phi_target_rt[None] = PHI_TARGET_DEFAULT
-    rref_target_rt[None] = RREF_TARGET_DEFAULT
-    domain_size_rt[None] = DOMAIN_SIZE
-
 @ti.kernel
 def init_decision_fields(n: ti.i32):
     """Initialize per-particle decision fields (action, lock_pulses, streak) to zero."""
@@ -196,115 +181,6 @@ def init_decision_fields(n: ti.i32):
         action[i] = 0       # Start with hold
         lock_pulses[i] = 0  # No lock
         streak[i] = 0       # No streak
-
-# ==============================================================================
-# Box Scaling Helpers
-# ==============================================================================
-
-def suggest_cell_size(r_max):
-    """Suggest grid cell size from max radius (keep neighbor search tight)."""
-    return 2.2 * r_max
-
-def grid_from_box_and_rmax(L, r_max):
-    """Compute cell size and grid resolution from box size and max radius."""
-    cell = suggest_cell_size(r_max)
-    res = max(4, int(math.ceil(L / cell)))
-    return cell, res
-
-def compute_L_lock_rref(N, phi, r_ref):
-    """
-    Compute box side length L to fit N particles at packing fraction φ
-    with fixed reference radius r_ref.
-    
-    Formula: V = (4π/3) * N * r_ref³ / φ, then L = V^(1/3)
-    """
-    V = (4.0 * math.pi / 3.0) * N * (r_ref ** 3) / phi
-    return V ** (1.0 / 3.0)
-
-def write_domain_size_to_config(L):
-    """
-    Write DOMAIN_SIZE to config.py automatically.
-    Preserves all other settings.
-    """
-    import re
-    import os
-    
-    # Get path relative to this script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "config.py")
-    
-    try:
-        with open(config_path, 'r') as f:
-            content = f.read()
-        
-        # Replace DOMAIN_SIZE = <value> line
-        pattern = r'(DOMAIN_SIZE\s*=\s*)[\d.]+(\s*#.*)?'
-        replacement = rf'\g<1>{L:.6f}\2'
-        new_content = re.sub(pattern, replacement, content)
-        
-        with open(config_path, 'w') as f:
-            f.write(new_content)
-        
-        return True
-    except Exception as e:
-        print(f"[Box] ERROR writing to config.py: {e}")
-        return False
-
-def apply_manual_box(L):
-    """
-    Apply manual box size (user-specified L).
-    Writes DOMAIN_SIZE to config.py and EXITS to force restart.
-    """
-    import sys
-    
-    print(f"\n{'='*60}")
-    print(f"[Box][Manual] Requested L={L:.6f}")
-    
-    # Show what grid params would be
-    r_max = float(gui_r_max)
-    cell, res = grid_from_box_and_rmax(L, r_max)
-    
-    # Write to config.py
-    if write_domain_size_to_config(L):
-        print(f"[Box][Manual] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
-        print(f"[Box][Manual] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
-        print(f"\n🔄 CONFIG UPDATED - EXITING TO APPLY CHANGES")
-        print(f"   Run ./run.sh again to see new box size")
-        print(f"{'='*60}\n")
-        sys.exit(0)
-    else:
-        print(f"[Box][Manual] ✗ Failed to write config.py (manual edit required)")
-        print(f"[Box][Manual] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
-        print(f"{'='*60}\n")
-
-def apply_auto_box(N, phi, r_ref):
-    """
-    Apply auto box scaling (keep r_ref, grow box to maintain φ).
-    Writes DOMAIN_SIZE to config.py and EXITS to force restart.
-    """
-    import sys
-    
-    L = compute_L_lock_rref(N, phi, r_ref)
-    
-    print(f"\n{'='*60}")
-    print(f"[Box][Auto] N={N}, φ={phi:.2f}, r_ref={r_ref:.6f} → L={L:.6f}")
-    
-    # Show what grid params would be
-    r_max = float(gui_r_max)
-    cell, res = grid_from_box_and_rmax(L, r_max)
-    
-    # Write to config.py
-    if write_domain_size_to_config(L):
-        print(f"[Box][Auto] ✓ Written DOMAIN_SIZE={L:.6f} to config.py")
-        print(f"[Box][Auto] Suggested: CELL_SIZE={cell:.6f}, GRID_RES={res}")
-        print(f"\n🔄 CONFIG UPDATED - EXITING TO APPLY CHANGES")
-        print(f"   Run ./run.sh again to see new box size")
-        print(f"{'='*60}\n")
-        sys.exit(0)
-    else:
-        print(f"[Box][Auto] ✗ Failed to write config.py (manual edit required)")
-        print(f"[Box][Auto] Set DOMAIN_SIZE={L:.6f} in config.py and relaunch")
-        print(f"{'='*60}\n")
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
@@ -424,9 +300,6 @@ def initialize_simulation(n):
     
     # Initialize visualization settings
     init_visual_runtime()
-    
-    # Initialize box scaling settings
-    init_box_scaling_runtime()
     
     # Initialize decision fields (action, lock_pulses, streak)
     init_decision_fields(n)
@@ -1031,61 +904,6 @@ while window.running:
             dim = viz_dim_alpha_rt[None]
             dim = window.GUI.slider_float("Dim level", dim, 0.0, 0.5)
             viz_dim_alpha_rt[None] = dim
-    
-    window.GUI.text("")
-    
-    # === Box Scaling ===
-    window.GUI.text(f"=== Box Scaling ===")
-    window.GUI.text(f"Current: L={DOMAIN_SIZE:.4f}, N={active_n}")
-    
-    # Auto/Manual toggle
-    auto_toggle = auto_box_scaling[None] == 1
-    auto_toggle = window.GUI.checkbox("Auto box scaling", auto_toggle)
-    auto_box_scaling[None] = 1 if auto_toggle else 0
-    
-    if auto_box_scaling[None] == 0:
-        # MANUAL MODE
-        window.GUI.text("(Manual: adjust L, press Apply)")
-        L = domain_size_rt[None]
-        L = window.GUI.slider_float("Box side L", L, 0.05, 1.00)
-        domain_size_rt[None] = L
-        
-        # Preview grid params
-        r_max_preview = gui_r_max
-        cell_preview, res_preview = grid_from_box_and_rmax(L, r_max_preview)
-        window.GUI.text(f"  Preview: CELL={cell_preview:.5f}, GRID_RES={res_preview}")
-        
-        if window.GUI.button("Apply (Manual)"):
-            apply_manual_box(domain_size_rt[None])
-    else:
-        # AUTO MODE (correction formula)
-        window.GUI.text("(Auto: keep r_ref, grow box)")
-        window.GUI.text(f"Config N={N} (change in config.py)")
-        
-        phi = phi_target_rt[None]
-        rref = rref_target_rt[None]
-        
-        phi = window.GUI.slider_float("Target φ", phi, 0.10, 0.60)
-        rref = window.GUI.slider_float("Target r_ref", rref, 0.0005, 0.0100)
-        
-        phi_target_rt[None] = phi
-        rref_target_rt[None] = rref
-        
-        # Preview computed values (use config N, not active_n)
-        L_preview = compute_L_lock_rref(N, phi, rref)
-        r_max_preview = gui_r_max
-        cell_preview, res_preview = grid_from_box_and_rmax(L_preview, r_max_preview)
-        
-        window.GUI.text(f"  L={L_preview:.5f}  cell={cell_preview:.5f}  res={res_preview}")
-        
-        if window.GUI.button("Apply (Auto)"):
-            apply_auto_box(N, phi, rref)
-    
-    # Grid health check
-    if gui_r_max > 0.5 * CELL_SIZE:
-        window.GUI.text("⚠ Grid too coarse (r_max > 0.5×CELL_SIZE)")
-    elif gui_r_max < 0.1 * CELL_SIZE:
-        window.GUI.text("ℹ Grid finer than needed")
     
     window.GUI.text("")
     show_centers_only = window.GUI.checkbox("Show centers only", show_centers_only)
