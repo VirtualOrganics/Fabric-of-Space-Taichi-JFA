@@ -18,6 +18,7 @@ Controls:
 import taichi as ti
 import numpy as np
 import time  # For performance profiling
+import math  # For box scaling calculations
 
 # Import configuration and kernels
 from config import (
