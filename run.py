@@ -50,7 +50,7 @@ from dynamics import (
     update_radii_xpbd, apply_xsph_smoothing,
     init_jitter_velocities, apply_brownian, integrate_jitter,
     compute_mean_radius, smooth_degree, levy_position_diffusion,
-    update_colors_by_size, filter_particles_by_band
+    update_colors_by_size, filter_write_indices, gather_filtered_to_render
 )
 
 # Phase B: Topological neighbor counting
@@ -82,10 +82,14 @@ vel = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Velocities (for force f
 vel_temp = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Temporary buffer for XSPH
 
 # Rendering buffers (for filtered visualization in band mode)
-pos_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)    # Filtered positions for rendering
-rad_render = ti.field(dtype=ti.f32, shape=MAX_N)              # Filtered radii for rendering
-color_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)  # Filtered colors for rendering
-render_count = ti.field(dtype=ti.i32, shape=())               # Number of particles to render
+MAX_RENDER = MAX_N  # Maximum render buffer size
+idx_render = ti.field(dtype=ti.i32, shape=MAX_RENDER)  # Filtered particle indices
+render_count = ti.field(dtype=ti.i32, shape=())        # Number of particles to render
+
+# Taichi render buffers (Metal requires Taichi fields for per-vertex attributes)
+pos_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER)  # Filtered positions
+rad_render = ti.field(dtype=ti.f32, shape=MAX_RENDER)            # Filtered radii
+col_render = ti.Vector.field(3, dtype=ti.f32, shape=MAX_RENDER)  # Filtered colors
 
 # Brownian motion (OU jitter velocities)
 v_jit = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)   # Jitter velocities (OU process)
@@ -105,6 +109,9 @@ viz_band_max_rt = ti.field(dtype=ti.f32, shape=())       # Band max radius (for 
 viz_hide_out_rt = ti.field(dtype=ti.i32, shape=())       # 0=dim, 1=hide out-of-band
 viz_palette_rt = ti.field(dtype=ti.i32, shape=())        # 0=Viridis, 1=Turbo, 2=Inferno
 viz_dim_alpha_rt = ti.field(dtype=ti.f32, shape=())      # Dim factor for out-of-band particles
+
+# Debug mode for filter testing (0=Normal, 1=ALL, 2=EVERY_OTHER, 3=MIDDLE_THIRD)
+VIZ_FILTER_FORCE_MODE = ti.field(dtype=ti.i32, shape=())
 
 # Grid data
 cell_count = ti.field(dtype=ti.i32, shape=GRID_RES**3)  # Particles per cell
@@ -148,6 +155,7 @@ def init_visual_runtime():
     viz_hide_out_rt[None] = 0      # Dim by default (not hide)
     viz_palette_rt[None] = 1       # Turbo (punchy, good contrast)
     viz_dim_alpha_rt[None] = 0.08  # Subtle dim for out-of-band
+    VIZ_FILTER_FORCE_MODE[None] = 0  # Start with normal filter
 
 @ti.kernel
 def wrap_seeded_positions(n: ti.i32):
@@ -620,56 +628,72 @@ while window.running:
     camera.track_user_inputs(window, movement_speed=0.01, hold_key=ti.ui.RMB)
     # Keep camera pivoting around domain center
     camera.lookat(domain_center, domain_center, domain_center)
-    scene.set_camera(camera)
-    scene.ambient_light((0.8, 0.8, 0.8))
-    scene.point_light(pos=(0.5, 1.0, 0.5), color=(1, 1, 1))
     
     # Decide which particles to render based on visualization mode
     use_filtered = (viz_mode_rt[None] == 2 and viz_hide_out_rt[None] == 1)
     
     if use_filtered:
-        # Band mode with hide: filter to in-band particles only
-        band_min_val = float(viz_band_min_rt[None])
-        band_max_val = float(viz_band_max_rt[None])
+        # === FILTERED PATH: Band mode with hide ===
         
-        # One-pass atomic filter
-        filter_particles_by_band(pos, rad, color, pos_render, rad_render, color_render,
-                                render_count, active_n, band_min_val, band_max_val)
+        # 1. Build index list on GPU
+        r_np_all = rad.to_numpy()[:active_n]
+        rmin_obs = float(r_np_all.min()) if active_n > 0 else 0.0
+        rmax_obs = float(r_np_all.max()) if active_n > 0 else 0.0
+        mode = int(VIZ_FILTER_FORCE_MODE[None])
+        band_min = float(viz_band_min_rt[None])
+        band_max = float(viz_band_max_rt[None])
+        
+        filter_write_indices(rad, idx_render, render_count, MAX_RENDER,
+                            mode, band_min, band_max, active_n, rmin_obs, rmax_obs)
         n_render = int(render_count[None])
         
         # Diagnostic output every 60 frames
         if frame % 60 == 0:
-            rad_np = rad.to_numpy()[:active_n]
-            print(f"[Band] band=[{band_min_val:.6f}, {band_max_val:.6f}] " +
-                  f"r_range=[{rad_np.min():.6f}, {rad_np.max():.6f}] " +
-                  f"rendered={n_render}/{active_n} ({100.0*n_render/max(1,active_n):.1f}%)")
+            print(f"[BandDbg] mode={mode} band=[{band_min:.6f},{band_max:.6f}] " +
+                  f"obs=[{rmin_obs:.6f},{rmax_obs:.6f}] -> kept {n_render}/{active_n} " +
+                  f"({100.0*n_render/max(1,active_n):.1f}%)")
         
-        # Render filtered particles (true transparency - out-of-band not drawn)
         if n_render > 0:
-            # Copy to NumPy and slice to n_render (Taichi fields render entire allocation!)
-            pos_render_np = pos_render.to_numpy()[:n_render]
-            rad_render_np = rad_render.to_numpy()[:n_render]
-            color_render_np = color_render.to_numpy()[:n_render]
+            # 2. GPU gather: copy filtered particles to render buffers (on-GPU, fast)
+            # This avoids .from_numpy() shape mismatch and keeps everything as Taichi fields
+            gather_filtered_to_render(
+                pos, rad, color,
+                idx_render,
+                pos_render, rad_render, col_render,
+                n_render, active_n
+            )
             
+            # 3. Set camera & lights
+            scene.set_camera(camera)
+            scene.ambient_light((0.8, 0.8, 0.8))
+            scene.point_light(pos=(0.5, 1.0, 0.5), color=(1, 1, 1))
+            
+            # 4. Draw with Taichi fields (Metal requires Taichi fields for per-vertex attrs)
             if show_centers_only:
-                scene.particles(pos_render_np, radius=0.0005, per_vertex_color=color_render_np)
+                scene.particles(pos_render, radius=0.0005, per_vertex_color=col_render)
             else:
-                scene.particles(pos_render_np, radius=0.001, per_vertex_radius=rad_render_np, per_vertex_color=color_render_np)
+                scene.particles(pos_render, radius=0.001, per_vertex_radius=rad_render, per_vertex_color=col_render)
+            
+            canvas.scene(scene)
         else:
-            # No particles in band - could show overlay message here
-            pass
+            # Nothing to draw
+            canvas.scene(scene)
+        
+        # CRITICAL: Skip unfiltered path (prevents double-draw)
+        # Continue to GUI section below, don't execute else branch
+        
     else:
-        # Normal rendering: all active particles
-        n_render = active_n
+        # === UNFILTERED PATH: Normal rendering ===
+        scene.set_camera(camera)
+        scene.ambient_light((0.8, 0.8, 0.8))
+        scene.point_light(pos=(0.5, 1.0, 0.5), color=(1, 1, 1))
         
         if show_centers_only:
-            # Show only center points (tiny uniform radius)
             scene.particles(pos, radius=0.0005, per_vertex_color=color)
         else:
-            # Show full spheres with VARIABLE RADII and DEGREE COLORS
             scene.particles(pos, radius=0.001, per_vertex_radius=rad, per_vertex_color=color)
-    
-    canvas.scene(scene)
+        
+        canvas.scene(scene)
     
     # === 7. GUI Control Panel ===
     # Compute statistics for distribution (only active particles)
@@ -751,6 +775,13 @@ while window.running:
     mode_labels = ["Degree", "Size Heatmap", "Size Band"]
     viz_mode_rt[None] = window.GUI.slider_int("Color Mode", viz_mode_rt[None], 0, 2)
     window.GUI.text(f"  Mode: {mode_labels[viz_mode_rt[None]]}")
+    
+    # Debug filter mode (only show in band mode with hide enabled)
+    if viz_mode_rt[None] == 2 and viz_hide_out_rt[None] == 1:
+        debug_mode_labels = ["Normal", "ALL", "EVERY_OTHER", "MIDDLE_THIRD"]
+        debug = window.GUI.slider_int("Filter debug", int(VIZ_FILTER_FORCE_MODE[None]), 0, 3)
+        VIZ_FILTER_FORCE_MODE[None] = int(debug)
+        window.GUI.text(f"  Debug: {debug_mode_labels[debug]}")
     
     # Palette selector (for size modes)
     if viz_mode_rt[None] >= 1:

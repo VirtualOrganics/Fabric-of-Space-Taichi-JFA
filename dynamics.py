@@ -842,43 +842,92 @@ def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.temp
 
 
 @ti.kernel
-def filter_particles_by_band(pos: ti.template(), rad: ti.template(), color: ti.template(),
-                             pos_render: ti.template(), rad_render: ti.template(), 
-                             color_render: ti.template(), render_count: ti.template(),
-                             n: ti.i32, band_min: ti.f32, band_max: ti.f32):
+def filter_write_indices(rad: ti.template(), idx_render: ti.template(), 
+                         render_count: ti.template(), max_render: ti.i32,
+                         mode: ti.i32, band_min: ti.f32, band_max: ti.f32,
+                         n: ti.i32, r_min_obs: ti.f32, r_max_obs: ti.f32):
     """
-    Copy only in-band particles to render buffers (one-pass atomic).
-    Used when hiding out-of-band particles for true transparency.
+    Surgical index-only filter: write indices, not full data copies.
+    
+    Modes:
+      0 = NORMAL: Use band_min/band_max from GUI
+      1 = ALL: Keep all particles (tests render path)
+      2 = EVERY_OTHER: Keep even indices (tests 50% filtering)
+      3 = MIDDLE_THIRD: Keep middle 33% of observed range (ignores GUI band)
     
     Args:
-        pos, rad, color: source particle data
-        pos_render, rad_render, color_render: destination render buffers
-        render_count: output count of in-band particles (0D field)
+        rad: particle radii
+        idx_render: output index buffer
+        render_count: output count (0D field)
+        max_render: maximum render buffer size
+        mode: filter mode selector
+        band_min, band_max: radius band from GUI (used in mode 0)
         n: total active particles
-        band_min, band_max: radius band to filter
-    
-    Note: Uses atomic counter for thread-safe parallel execution.
-    Performance cost is negligible (~0.1-0.3ms for 10K particles).
+        r_min_obs, r_max_obs: observed radius range (used in mode 3)
     """
-    # Reset counter every call (critical!)
     render_count[None] = 0
     
-    # Clamp and order band values inside kernel (guards GUI mistakes)
     lo = ti.min(band_min, band_max)
     hi = ti.max(band_min, band_max)
-    
-    # Widen vanishingly thin bands to avoid float precision zeroing everything
     eps = 1e-8
     lo -= eps
     hi += eps
     
-    # Single pass: atomic add for thread-safe parallel writes
+    # Middle third for debug mode 3
+    mid_lo = r_min_obs + (r_max_obs - r_min_obs) / 3.0
+    mid_hi = r_min_obs + 2.0 * (r_max_obs - r_min_obs) / 3.0
+    
     for i in range(n):
-        r = rad[i]
-        if (r >= lo) and (r <= hi):
-            # Atomic index increment ensures no race condition
+        keep = False
+        
+        if mode == 1:  # ALL
+            keep = True
+        elif mode == 2:  # EVERY_OTHER
+            keep = (i & 1) == 0
+        elif mode == 3:  # MIDDLE_THIRD (observed)
+            r = rad[i]
+            keep = (r >= mid_lo) and (r <= mid_hi)
+        else:  # NORMAL (band_min/band_max)
+            r = rad[i]
+            keep = (r >= lo) and (r <= hi)
+        
+        if keep:
             j = ti.atomic_add(render_count[None], 1)
-            pos_render[j] = pos[i]
-            rad_render[j] = r
-            color_render[j] = color[i]
+            if j < max_render:
+                idx_render[j] = i
+
+
+@ti.kernel
+def gather_filtered_to_render(
+    pos: ti.template(),
+    rad: ti.template(),
+    color: ti.template(),
+    idx_render: ti.template(),
+    pos_render: ti.template(),
+    rad_render: ti.template(),
+    col_render: ti.template(),
+    n_render: ti.i32,
+    active_n: ti.i32
+):
+    """
+    GPU gather kernel: copies filtered particles to render buffers.
+    
+    Copies first n_render filtered particles from source fields to render fields.
+    Pushes remaining particles off-screen so they don't render.
+    
+    This avoids shape mismatch issues with .from_numpy() and keeps everything
+    as Taichi fields for Metal compatibility.
+    """
+    # Copy filtered particles into render fields [0 .. n_render-1]
+    for i in range(n_render):
+        j = idx_render[i]  # Original particle index
+        pos_render[i] = pos[j]
+        rad_render[i] = rad[j]
+        col_render[i] = color[j]  # Vector field, copy all components
+    
+    # Push remainder off-screen (beyond camera view) with zero radius
+    for i in range(n_render, active_n):
+        pos_render[i] = ti.Vector([1e6, 1e6, 1e6])
+        rad_render[i] = 0.0
+        col_render[i] = ti.Vector([0.0, 0.0, 0.0])
 
