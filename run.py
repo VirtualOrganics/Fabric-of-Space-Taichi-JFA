@@ -227,7 +227,11 @@ def write_domain_size_to_config(L):
     Preserves all other settings.
     """
     import re
-    config_path = "config.py"
+    import os
+    
+    # Get path relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "config.py")
     
     try:
         with open(config_path, 'r') as f:
