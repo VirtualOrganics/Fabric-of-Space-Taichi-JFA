@@ -51,8 +51,9 @@ from config import (
     AUTO_SCALE_RADII, PHI_TARGET,
     # JFA Power Diagram (experimental)
     JFA_ENABLED, JFA_RUN_INTERVAL, JFA_EMA_ALPHA,
-    # JFA Optimization (Multi-rate)
+    # JFA Optimization (Multi-rate + Adaptive Resolution)
     JFA_CADENCE, JFA_WARMSTART_FRAMES, JFA_WATCHDOG_INTERVAL,
+    JFA_ADAPTIVE_ENABLED, JFA_VOXELS_PER_DIAMETER, JFA_RES_MIN, JFA_RES_MAX, JFA_VOXEL_SCALE,
     # FSC-Only Controller (Phase 2)
     FSC_MANUAL_MODE, FSC_LOW, FSC_HIGH, GROWTH_PCT, ADJUSTMENT_FRAMES,
     MAX_STEP_PCT, MAX_STEP_PCT_RANGE,
@@ -513,6 +514,13 @@ print(f"  - S: Export particle data")
 print(f"  - F: Freeze-frame diagnostic (test temporal skew hypothesis)")
 print(f"  - ESC: Exit")
 print("="*70)
+
+# Print JFA adaptive resolution config
+if JFA_ADAPTIVE_ENABLED:
+    print(f"\nJFA ADAPTIVE RESOLUTION:")
+    print(f"  target={JFA_VOXELS_PER_DIAMETER:.1f} voxels/diameter | range=[{JFA_RES_MIN}, {JFA_RES_MAX}]³")
+    print(f"  Resolution scales dynamically with mean particle radius")
+
 if PRESSURE_EQUILIBRATION_ENABLED:
     print(f"\nPRESSURE EQUILIBRATION:")
     print(f"  k={PRESSURE_K:.3f} | P_exp={PRESSURE_EXP:.1f} | pair_cap={PRESSURE_PAIR_CAP:.2f}")
@@ -875,16 +883,23 @@ while window.running:
                     jfa_should_run = False
             
             if jfa_should_run:
-                # Step 2: Dynamic resolution based on mean particle radius
-                # Compute mean radius and set JFA_RES dynamically
+                # Step 2: Adaptive resolution based on mean particle radius
+                # Compute mean radius for dynamic resolution scaling
                 r_mean_np = rad.to_numpy()[:active_n]
                 r_mean = float(r_mean_np.mean())
                 
-                # Voxel size ≈ 2.5-3.0 × mean radius (ensures particles span multiple voxels)
-                from config import JFA_VOXEL_SCALE, JFA_RES_MIN, JFA_RES_MAX
-                voxel_size = JFA_VOXEL_SCALE * r_mean
-                jfa_res_dynamic = int(round(DOMAIN_SIZE / voxel_size))
-                jfa_res_dynamic = max(JFA_RES_MIN, min(jfa_res_dynamic, JFA_RES_MAX))
+                if JFA_ADAPTIVE_ENABLED:
+                    # Adaptive resolution: target N voxels across particle diameter
+                    # res = L / (2 * r_mean / voxels_per_diameter)
+                    #     = L * voxels_per_diameter / (2 * r_mean)
+                    # This ensures each particle diameter spans JFA_VOXELS_PER_DIAMETER voxels
+                    jfa_res_dynamic = int(round(DOMAIN_SIZE * JFA_VOXELS_PER_DIAMETER / (2.0 * r_mean)))
+                    jfa_res_dynamic = max(JFA_RES_MIN, min(jfa_res_dynamic, JFA_RES_MAX))
+                else:
+                    # Legacy: Voxel size ≈ 2.5-3.0 × mean radius
+                    voxel_size = JFA_VOXEL_SCALE * r_mean
+                    jfa_res_dynamic = int(round(DOMAIN_SIZE / voxel_size))
+                    jfa_res_dynamic = max(JFA_RES_MIN, min(jfa_res_dynamic, JFA_RES_MAX))
                 
                 # Update JFA resolution dynamically
                 jfa.set_resolution(jfa_res_dynamic)

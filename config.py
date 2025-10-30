@@ -157,6 +157,12 @@ JFA_RES_MIN = 192           # Minimum grid resolution (per Perplexity: need ≥1
 JFA_RES_MAX = 320           # Maximum grid resolution (per Perplexity: 16 voxels/diameter = reliable)
 JFA_VOXEL_SCALE = 2.8       # Voxel size = VOXEL_SCALE × r_mean (tune 2.5-3.0)
 
+# Adaptive resolution: target number of voxels across mean particle diameter
+# Higher = more accurate but slower. Lower = faster but less accurate.
+# Typical: 10-16 voxels/diameter (Perplexity recommendation)
+JFA_ADAPTIVE_ENABLED = True  # Enable adaptive resolution based on r_mean
+JFA_VOXELS_PER_DIAMETER = 12.0  # Target voxels across particle diameter (balance speed/accuracy)
+
 # ==============================================================================
 # JFA OPTIMIZATION: Multi-Rate Loop (Decimation)
 # ==============================================================================
