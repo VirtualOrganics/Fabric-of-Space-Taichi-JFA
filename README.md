@@ -285,11 +285,6 @@ Geometric degree (distance-based neighbor counting) is unreliable and drifts wit
 
 ## 🐛 Known Issues & Limitations
 
-### σ(P) Telemetry (fp32 Underflow)
-- **Issue**: Pressure variance (`σ(P)`) reports `0.000000` due to fp32 precision limits
-- **Impact**: Diagnostic only; equilibrator is working (evidenced by `changed=9139/10000`)
-- **Fix**: Implement Welford's algorithm with fp64 accumulators (pending)
-
 ### JFA Asymmetry
 - **Issue**: JFA validation reports high asymmetry percentage (180-220%)
 - **Impact**: Known artifact of voxelized face detection; does not affect stability
@@ -298,6 +293,16 @@ Geometric degree (distance-based neighbor counting) is unreliable and drifts wit
 ### Resolution Scaling
 - **Issue**: Very small or very large particle counts may require JFA resolution tuning
 - **Workaround**: Adjust `JFA_RES_MIN` and `JFA_RES_MAX` in `config.py`
+
+---
+
+## ✅ Recently Fixed
+
+### σ(P) Telemetry (fp32 Underflow) - **FIXED**
+- **Was**: Pressure variance (`σ(P)`) reported `0.000000` due to GPU fp64 limitations
+- **Fix**: Moved variance computation to CPU-side using NumPy with fp64 accumulators (Welford's algorithm)
+- **Now**: `σ(P)` displays correctly in scientific notation (e.g., `σ(P)=2.12e-08`)
+- **Commit**: [b8943af](https://github.com/VirtualOrganics/Fabric-of-Space-Taichi-JFA/commit/b8943af) (Oct 30, 2025)
 
 ---
 
