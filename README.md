@@ -301,6 +301,47 @@ Geometric degree (distance-based neighbor counting) is unreliable and drifts wit
 
 ---
 
+## ⚡ Performance & Optimization
+
+### Current Performance
+- **~10 FPS** @ 10,000 particles (M1 Pro / RTX 3060 Ti)
+- **JFA = 77%** of frame time (topology detection bottleneck)
+- **Multi-rate decimation** (JFA every 5 frames) → **2.4× speedup**
+
+### Optimization Roadmap
+
+See **[`docs/GITHUB_ISSUES.md`](docs/GITHUB_ISSUES.md)** for detailed optimization issues and implementation plans:
+
+1. **Multi-Rate Loop (JFA Decimation)** ✅ *Implemented*  
+   Run JFA at 1/5 cadence with warm-start + watchdog → 2.4× speedup
+
+2. **Adaptive JFA Resolution**  
+   Scale voxel grid with mean radius dynamically (`res ∝ L / r_mean`)
+
+3. **Dirty Tiles (Spatial Decimation)**  
+   Only re-rasterize/propagate JFA in regions where particles moved
+
+4. **Early-Exit JFA Tightening**  
+   Stop flood passes early when FSC changes drop below threshold
+
+5. **Adaptive PBD Budget**  
+   Reduce iterations when overlap is low; skip grid rebuild if motion is minimal
+
+6. **Render Throttles**  
+   Drop render cadence when window not focused; batch HUD updates
+
+### Benchmarking
+
+Use the included benchmark script for reproducible performance testing:
+
+```bash
+python scripts/bench.py --particles 10000 --frames 200 --cadence 5
+```
+
+Outputs detailed timing breakdown and FPS metrics to `bench_results.json`.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
