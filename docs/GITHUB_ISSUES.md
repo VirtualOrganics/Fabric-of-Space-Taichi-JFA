@@ -170,69 +170,43 @@ find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 ---
 
-## Issue 4: Benchmark Harness & Performance Badge
+## Issue 4: Benchmark Harness & Performance Badge (DEFERRED)
 
 **Title:** Add reproducible benchmark script and performance tracking
 
-**Labels:** `tooling`, `performance`, `documentation`
+**Labels:** `tooling`, `performance`, `documentation`, `deferred`
+
+**Status:** Deferred until Phase 2 optimization is stable. The old benchmark script was removed due to architecture mismatch (expected class-based JFA, current code is functional).
 
 **Description:**
 
-Create a standalone benchmark script that runs a fixed number of frames with deterministic seed and reports consistent performance metrics. This enables:
-- Tracking performance improvements across commits
-- Regression detection
-- Comparative benchmarking on different hardware
+Create a lightweight headless benchmark that:
+- Disables rendering in `run.py`
+- Runs for fixed N frames
+- Parses `[PERF]` log output for timing breakdown
+- Computes mean FPS and per-stage averages
 
-### Implementation (✅ **Already Created**)
-
-**Created:** `scripts/bench.py`
-
-### Features
-
-- **Reproducible:** Fixed seed, fixed frame count, deterministic execution
-- **Configurable:** Particles, frames, JFA cadence via CLI args
-- **Headless:** Can run without GUI for CI/CD
-- **Detailed Metrics:** FPS, time breakdown (grid/PBD/topo/render), percentages
-
-### Usage
-
-```bash
-cd /Users/chimel/Desktop/Cursor_FoS-Custom-Grid
-./venv/bin/python scripts/bench.py --frames 100 --particles 10000
+**Note:** Current `run.py` already emits structured `[PERF]` logs every 60 frames:
+```
+[PERF] Frame 180: grid=0.000s  pbd=0.047s  topo=—  render=0.006s  | FPS≈4.3
+       Breakdown: grid=0%  pbd=20%  topo=77%  render=3%
 ```
 
-**Output:**
-```
-BENCHMARK RESULTS
-======================================================================
+### Implementation (TODO - Post Phase 2)
 
-Overall Performance:
-  Average FPS:   10.23
-  Total Time:    9.78s
-  Avg Frame:     97.8ms
-
-Time Breakdown (averages):
-  Grid:           0.12ms  (  0.1%)
-  PBD:           24.35ms  ( 24.9%)
-  Topology:      70.12ms  ( 71.7%)
-  Render:         3.21ms  (  3.3%)
-```
-
-### Future: Performance Badge
-
-Add to README.md:
-```markdown
-![Performance](https://img.shields.io/badge/FPS-~10.2_(10k_particles)-brightgreen.svg)
-```
+Will create `scripts/bench_headless.py` that:
+1. Imports and calls `main()` from `run.py` with `RENDER=False`
+2. Captures console output
+3. Parses `[PERF]` lines
+4. Computes aggregate statistics
 
 ### Acceptance Criteria
 
-- [x] Benchmark script created
-- [x] CLI arguments for configuration
-- [x] Reproducible results (fixed seed)
-- [x] Detailed time breakdown
+- [ ] Headless benchmark script
+- [ ] Parses existing `[PERF]` telemetry
+- [ ] Reproducible results (fixed seed)
+- [ ] JSON output for CI/CD tracking
 - [ ] Document usage in README.md
-- [ ] Optional: CI/CD integration to track perf over time
 
 ---
 
@@ -335,7 +309,7 @@ def update_tile_cache(pos, rad, last_pos, last_rad, n):
 | 1. JFA Cadence | ✅ Done | 2.4× | Low | Complete |
 | 2. Adaptive Resolution | 📋 Open | 1.3-1.5× | Low | **Next** |
 | 3. fp64 Welford | ✅ Done | N/A (bugfix) | Low | Complete |
-| 4. Benchmark Script | ✅ Done | N/A (tooling) | Low | Complete |
+| 4. Benchmark Script | 🔄 Deferred | N/A (tooling) | Low | Post-Phase 2 |
 | 5. Spatial Decimation | 📋 Open | 2-3× | High | Future |
 
 **Cumulative Expected Speedup:** 4.2 FPS → ~40-50 FPS (10-12× total)

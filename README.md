@@ -335,15 +335,7 @@ See **[`docs/GITHUB_ISSUES.md`](docs/GITHUB_ISSUES.md)** for detailed optimizati
 6. **Render Throttles**  
    Drop render cadence when window not focused; batch HUD updates
 
-### Benchmarking
-
-Use the included benchmark script for reproducible performance testing:
-
-```bash
-python scripts/bench.py --particles 10000 --frames 200 --cadence 5
-```
-
-Outputs detailed timing breakdown and FPS metrics to `bench_results.json`.
+> **Note:** Performance metrics are logged every 60 frames via `[PERF]` telemetry in the console. Use these for tracking optimization progress.
 
 ---
 
