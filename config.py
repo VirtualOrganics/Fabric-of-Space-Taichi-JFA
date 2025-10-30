@@ -157,6 +157,16 @@ JFA_RES_MIN = 192           # Minimum grid resolution (per Perplexity: need ≥1
 JFA_RES_MAX = 320           # Maximum grid resolution (per Perplexity: 16 voxels/diameter = reliable)
 JFA_VOXEL_SCALE = 2.8       # Voxel size = VOXEL_SCALE × r_mean (tune 2.5-3.0)
 
+# ==============================================================================
+# JFA OPTIMIZATION: Multi-Rate Loop (Decimation)
+# ==============================================================================
+# Run JFA less frequently to reduce frame time (JFA = 77% of frame cost)
+# Safety: Warm-start + watchdog to ensure topology doesn't drift
+
+JFA_CADENCE = 5                   # Run JFA every N frames (after warm-start)
+JFA_WARMSTART_FRAMES = 30         # Force every-frame JFA during first N frames (topology stabilization)
+JFA_WATCHDOG_INTERVAL = 30        # Force full refresh every N JFA runs (catch drift)
+
 # Precomputed constants (Python scope, compile-time folded by Taichi)
 HALF_L = 0.5 * DOMAIN_SIZE  # Half domain size for centered coordinates
 INV_L = 1.0 / DOMAIN_SIZE   # Inverse domain size (avoid repeated division)

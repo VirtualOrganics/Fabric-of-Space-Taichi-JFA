@@ -1320,6 +1320,50 @@ def set_fsc_targets(
                 rad_target[i] = ti.max(r0 * (1.0 - growth_pct * idle_rate), r_min)
 
 @ti.kernel
+def compute_controller_stats(
+    rad: ti.template(),
+    rad_target: ti.template(),
+    fsc_ema: ti.template(),
+    n: ti.i32,
+    f_low: ti.i32,
+    f_high: ti.i32
+) -> (ti.i32, ti.i32, ti.i32, ti.f32, ti.f32):
+    """
+    Compute diagnostic statistics for the FSC controller.
+    
+    Returns: (grow_count, shrink_count, idle_count, mean_delta_r, max_delta_r)
+    """
+    grow_cnt = ti.cast(0, ti.i32)
+    shrink_cnt = ti.cast(0, ti.i32)
+    idle_cnt = ti.cast(0, ti.i32)
+    sum_delta = 0.0
+    max_delta = 0.0
+    
+    f_low_f = ti.cast(f_low, ti.f32)
+    f_high_f = ti.cast(f_high, ti.f32)
+    
+    for i in range(n):
+        f = fsc_ema[i]
+        delta_r = rad_target[i] - rad[i]
+        
+        # Classify action based on FSC
+        if f < f_low_f:
+            grow_cnt += 1
+        elif f > f_high_f:
+            shrink_cnt += 1
+        else:
+            idle_cnt += 1
+        
+        # Accumulate delta statistics
+        sum_delta += delta_r
+        if ti.abs(delta_r) > max_delta:
+            max_delta = ti.abs(delta_r)
+    
+    mean_delta = sum_delta / ti.max(1, n)
+    return grow_cnt, shrink_cnt, idle_cnt, mean_delta, max_delta
+
+
+@ti.kernel
 def nudge_radii_adaptive_ema(
     rad: ti.template(),
     rad_target: ti.template(),

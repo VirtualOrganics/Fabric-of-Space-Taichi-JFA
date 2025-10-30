@@ -51,6 +51,8 @@ from config import (
     AUTO_SCALE_RADII, PHI_TARGET,
     # JFA Power Diagram (experimental)
     JFA_ENABLED, JFA_RUN_INTERVAL, JFA_EMA_ALPHA,
+    # JFA Optimization (Multi-rate)
+    JFA_CADENCE, JFA_WARMSTART_FRAMES, JFA_WATCHDOG_INTERVAL,
     # FSC-Only Controller (Phase 2)
     FSC_MANUAL_MODE, FSC_LOW, FSC_HIGH, GROWTH_PCT, ADJUSTMENT_FRAMES,
     MAX_STEP_PCT, MAX_STEP_PCT_RANGE,
@@ -86,7 +88,7 @@ from dynamics import (
     compute_mean_radius, levy_position_diffusion,
     update_colors_by_size, filter_write_indices, gather_filtered_to_render,
     # FSC-Only Controller (Phase 2)
-    set_fsc_targets, nudge_radii_adaptive_ema,
+    set_fsc_targets, nudge_radii_adaptive_ema, compute_controller_stats,
     # Pressure Equilibration
     equilibrate_pressure, compute_pressure_stats,
     # Brownian Motion
@@ -150,6 +152,10 @@ grow_rate_rt = ti.field(dtype=ti.f32, shape=())          # Growth/shrink rate pe
 adjustment_frames_rt = ti.field(dtype=ti.i32, shape=())  # Frames to adjust size (runtime)
 adjustment_timer = ti.field(dtype=ti.i32, shape=())      # Countdown: 0 = measure, >0 = adjusting
 
+# JFA cadence tracking (multi-rate optimization)
+jfa_frame_counter = ti.field(dtype=ti.i32, shape=())     # Frame counter for JFA cadence
+jfa_watchdog_counter = ti.field(dtype=ti.i32, shape=())  # Watchdog counter (force refresh every N JFA runs)
+
 # Runtime particle sizing control
 r_start_rt = ti.field(dtype=ti.f32, shape=())            # Starting radius (for reset/GUI)
 
@@ -193,6 +199,8 @@ def init_rhythm_runtime():
     grow_rate_rt[None] = GROWTH_RATE_DEFAULT
     adjustment_frames_rt[None] = ADJUSTMENT_FRAMES_DEFAULT
     adjustment_timer[None] = 0  # Start by measuring immediately
+    jfa_frame_counter[None] = 0  # Initialize JFA frame counter
+    jfa_watchdog_counter[None] = 0  # Initialize JFA watchdog counter
     r_start_rt[None] = R_START_MANUAL  # Starting radius for particles
 
 def init_visual_runtime():
@@ -821,14 +829,36 @@ while window.running:
             if JFA_ENABLED and adjustment_timer[None] <= 0:
                 jfa_measurement_counter += 1
             
-            # FIX 1: Force JFA to run UNCONDITIONALLY in manual mode (no gates, no cadence)
-            # In manual mode, we need FSC every measurement for immediate feedback
+            # ================================================================
+            # MULTI-RATE JFA (Decimation with Warm-start + Watchdog)
+            # ================================================================
+            # Goal: Run JFA less frequently to reduce frame time (JFA = 77% of cost)
+            # Safety: Warm-start period + periodic watchdog to ensure no drift
+            
+            jfa_should_run = False
+            
             if JFA_ENABLED and FSC_MANUAL_MODE:
-                jfa_should_run = True  # Always run, no conditions
-            elif JFA_ENABLED and adjustment_timer[None] <= 0:
-                jfa_should_run = (jfa_measurement_counter % JFA_RUN_INTERVAL == 0)
-            else:
-                jfa_should_run = False
+                # Increment frame counter
+                jfa_frame_counter[None] += 1
+                current_frame = jfa_frame_counter[None]
+                
+                # Warm-start period: run JFA every frame to stabilize topology
+                if current_frame <= JFA_WARMSTART_FRAMES:
+                    jfa_should_run = True
+                    if current_frame == 1:
+                        print(f"[JFA Cadence] Warm-start: running every frame for first {JFA_WARMSTART_FRAMES} frames")
+                # After warm-start: decimate to every N frames
+                elif current_frame % JFA_CADENCE == 0:
+                    jfa_should_run = True
+                    jfa_watchdog_counter[None] += 1
+                    
+                    # Watchdog: force refresh every M JFA runs (catch drift)
+                    if jfa_watchdog_counter[None] >= JFA_WATCHDOG_INTERVAL:
+                        jfa_watchdog_counter[None] = 0
+                        if current_frame == JFA_WARMSTART_FRAMES + JFA_CADENCE:
+                            print(f"[JFA Cadence] Decimation: running every {JFA_CADENCE} frames (watchdog every {JFA_WATCHDOG_INTERVAL} runs)")
+                else:
+                    jfa_should_run = False
             
             if jfa_should_run:
                 # Step 2: Dynamic resolution based on mean particle radius
@@ -943,6 +973,14 @@ while window.running:
                     float(GROWTH_PCT),
                     float(R_MIN), float(R_MAX)
                 )
+                
+                # Diagnostic: Compute controller statistics
+                grow_cnt, shrink_cnt, idle_cnt, mean_dr, max_dr = compute_controller_stats(
+                    rad, rad_target, jfa.fsc_ema,
+                    int(active_n),
+                    int(gui_fsc_low), int(gui_fsc_high)
+                )
+                print(f"[Controller Diag] grow={grow_cnt} shrink={shrink_cnt} idle={idle_cnt} | mean(Δr)={mean_dr:.8f} max|Δr|={max_dr:.8f}")
                 
                 # Reset settle counter
                 settle_frames_left = int(ADJUSTMENT_FRAMES)

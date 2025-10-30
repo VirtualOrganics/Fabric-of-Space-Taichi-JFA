@@ -1,10 +1,47 @@
-# Fabric of Space - FSC-Only Foam Simulator
+# Fabric of Space - Topological Foam Simulator
 
-A real-time GPU-accelerated foam simulation driven purely by topological (Face-Sharing Count) properties, implemented in Taichi. This simulator models 3D foam behavior using power diagrams and pressure equilibration, with continuous dynamics and live interactive control.
+> **"Topology-driven foam: cells grow/shrink by neighbor count (FSC), pressure flows through shared faces—no forces, pure structure-to-mechanics control."**
+
+A real-time GPU-accelerated foam simulation implementing **dual-channel topological control**: Face-Sharing Count (FSC) from power diagrams drives structural adaptation, while volume-conserving pressure equilibration ensures mechanical consistency. Interactive, GPU-optimized, and running at ~10 FPS on 10,000 particles.
 
 ![Foam Simulation](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![Taichi](https://img.shields.io/badge/Taichi-1.7.0+-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Performance](https://img.shields.io/badge/Performance-~10_FPS_(10k_particles)-brightgreen.svg)
+
+---
+
+## 📝 **What Is This?**
+
+### **Short Description**
+
+**Fabric of Space: Topological Foam Simulator**  
+Real-time cellular structure evolution driven by **Face-Sharing Count (FSC)** from a power diagram. Cells adapt radii to maintain target connectivity; volume-conserving pressure diffusion creates mechanical equilibrium. PBD enforces constraints, Minkowski spheres visualize pressure. GPU-accelerated (~10 FPS, 10k particles), interactive via live FSC band sliders. **No SPH, no DEM forces—pure control theory.**
+
+### **Technical Description**
+
+A dual-channel topological foam simulator implementing control-theoretic cellular adaptation:
+
+**Channel 1: FSC Controller (Structural)**  
+Jump Flood Algorithm (JFA) computes a 3D power diagram (weighted Voronoi tessellation) to extract Face-Sharing Counts—the number of topological neighbors per cell. Cells adjust radii via adaptive EMA to maintain a target FSC band, driving long-term structural evolution with hysteresis to prevent oscillation.
+
+**Channel 2: Pressure Equilibrator (Mechanical)**  
+Volume-conserving pressure diffusion across FSC neighbors using Jacobi iteration. Each frame, volume flows between topologically connected cells (∆V ∝ P_i - P_j) until local mechanical equilibrium. No explicit forces; pressure gradients emerge from volume imbalance.
+
+**Supporting Systems:**  
+- Position-Based Dynamics (PBD): Enforces non-penetration constraints  
+- Brownian motion: Thermal agitation prevents frozen equilibrium  
+- Periodic boundary conditions (PBC): Unbounded domain simulation  
+- Minkowski sphere rendering: Visualizes pressure fields, not geometric surfaces  
+
+**Performance:**  
+Multi-rate JFA decimation (1/5 cadence after warm-start) achieves ~10 FPS on 10k particles (2.4× speedup). Adaptive resolution, warm-start topology stabilization, and watchdog drift detection ensure correctness.
+
+**Key Distinction:** Neither SPH (no Navier-Stokes PDEs) nor classical DEM (no Hertzian contact forces). Instead, a **control-theoretic** approach where topology defines structure and volume flux defines dynamics. Suitable for studying emergent foam behavior, cellular packing, and topological phase transitions.
+
+### **One-Liner for Papers/Citations**
+
+*"A control-theoretic cellular simulator where topological properties (Face-Sharing Count from power diagrams) govern structural adaptation, and volume-conserving pressure diffusion enforces mechanical equilibrium—without explicit forces or fluid PDEs. The approach bridges computational geometry (JFA-based topology detection) and dynamical systems (dual-channel feedback control)."*
 
 ## 🌟 Features
 
