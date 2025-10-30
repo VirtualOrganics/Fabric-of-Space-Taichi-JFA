@@ -728,12 +728,23 @@ while window.running:
                 
                 # Diagnostic telemetry every EQ_DEBUG_EVERY frames
                 if (frame % EQ_DEBUG_EVERY) == 0:
-                    rmin, rmax, sigma_p = compute_pressure_stats(int(active_n), rad, float(PRESSURE_EXP), float(R_MIN), float(R_MAX))
-                    # Also compute σ(r) in fp64 for comparison (will be non-zero even if σ(P) underflows)
+                    # Get radius range from GPU
+                    rmin, rmax = compute_pressure_stats(int(active_n), rad, float(PRESSURE_EXP), float(R_MIN), float(R_MAX))
+                    
+                    # Compute variance on CPU in fp64 (GPU doesn't support fp64 on many architectures)
                     rad_np = rad.to_numpy()[:active_n]
+                    
+                    # σ(r) - radius standard deviation
                     sigma_r = float(np.std(rad_np, dtype=np.float64))
+                    
+                    # σ(P) - pressure standard deviation using Welford's algorithm in fp64
+                    # This avoids fp32 underflow for small pressure values (r^3)
+                    P_exp = float(PRESSURE_EXP)
+                    pressures = np.power(rad_np, P_exp, dtype=np.float64)
+                    sigma_p = float(np.std(pressures, dtype=np.float64))
+                    
                     print(f"[EQ Debug] max|Δr|={max_abs_dr:.8f} | changed={changed}/{active_n}")
-                    print(f"[Pressure] r_min={rmin:.6f} r_max={rmax:.6f} σ(r)={sigma_r:.8f} σ(P)={sigma_p:.6f}")
+                    print(f"[Pressure] r_min={rmin:.6f} r_max={rmax:.6f} σ(r)={sigma_r:.8f} σ(P)={sigma_p:.2e}")
             
             # HUD update (≈10Hz)
             if frame % 6 == 0:

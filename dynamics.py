@@ -1558,45 +1558,35 @@ def equilibrate_pressure(
 
 
 @ti.kernel
-def compute_pressure_stats(n: ti.i32, rad: ti.template(), P_exp: ti.f32, r_min: ti.f32, r_max: ti.f32) -> (ti.f32, ti.f32, ti.f32):
+def compute_pressure_stats(n: ti.i32, rad: ti.template(), P_exp: ti.f32, r_min: ti.f32, r_max: ti.f32) -> (ti.f32, ti.f32):
     """
-    Compute pressure statistics for telemetry.
+    Compute radius range for telemetry.
     
-    Reads rad[] directly to compute pressure variance and radius range.
+    Note: Pressure variance (σ(P)) is computed on CPU side in fp64 due to GPU fp64 limitations.
+    This kernel only returns radius min/max for efficiency.
     
     Args:
         n: Number of active particles
         rad: Particle radii
-        P_exp: Pressure exponent (for pressure metric)
+        P_exp: Pressure exponent (unused here, kept for API compatibility)
         r_min: Minimum radius threshold (for range check)
         r_max: Maximum radius threshold (for range check)
     
     Returns:
-        (rmin, rmax, sigmaP): Radius min, radius max, pressure std deviation
+        (rmin, rmax): Radius min, radius max
     """
     rmin = 1e9
     rmax = -1e9
-    meanP = 0.0
     
-    # First pass: compute mean pressure and radius range
+    # Track radius range
     for i in range(n):
         r = rad[i]
         if r < rmin:
             rmin = r
         if r > rmax:
             rmax = r
-        meanP += r ** P_exp
-    meanP /= ti.max(1, n)
     
-    # Second pass: compute pressure variance
-    varP = 0.0
-    for i in range(n):
-        diff = (rad[i] ** P_exp) - meanP
-        varP += diff * diff
-    varP /= ti.max(1, n)
-    sigmaP = ti.sqrt(varP)
-    
-    return rmin, rmax, sigmaP
+    return rmin, rmax
 
 
 # ==============================================================================
