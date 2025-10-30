@@ -2,6 +2,10 @@
 
 > **"Topology-driven foam: cells grow/shrink by neighbor count (FSC), pressure flows through shared faces—no forces, pure structure-to-mechanics control."**
 
+![Simulation Demo](images/simulation-demo.png)
+
+*Real-time topological foam simulation with 10,000 particles showing size-based heatmap coloring and live FSC control panel.*
+
 A real-time GPU-accelerated foam simulation implementing **dual-channel topological control**: Face-Sharing Count (FSC) from power diagrams drives structural adaptation, while volume-conserving pressure equilibration ensures mechanical consistency. Interactive, GPU-optimized, and running at ~10 FPS on 10,000 particles.
 
 ![Foam Simulation](https://img.shields.io/badge/Python-3.9+-blue.svg)
