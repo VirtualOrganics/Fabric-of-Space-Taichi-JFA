@@ -224,87 +224,163 @@ Will create `scripts/bench_headless.py` that:
 
 **Description:**
 
-**⚠️ Advanced Optimization - Implement after Issues 2-4**
+**⚠️ Advanced Optimization - High-impact performance multiplier**
 
-Only re-compute JFA in regions where particles have moved or changed size significantly. This is the most complex optimization but offers the largest potential gain.
+Only re-compute JFA in regions (tiles) where particles have moved or changed size significantly since the last JFA run. This is the most complex optimization but offers the largest potential gain: **2-6× speedup on top of existing optimizations**.
 
 ### Goal
 
-- **Expected Gain:** 2-3× additional speedup (13-15 FPS → 30-40 FPS)
-- **Complexity:** High (tile tracking, halo regions, invalidation logic)
+- **Expected Gain:** 
+  - Early settling: 1.5-2× (dirty 40-60%)
+  - Late equilibrium: 4-8× (dirty 10-20%)
+  - Combined with cadence + adaptive res: **15-30 FPS** (from current ~8 FPS)
+- **Complexity:** High (tile tracking, halo regions, watchdog)
 
-### Implementation Plan
+---
 
-**1. Tile Grid (`config.py`):**
+### 🔧 Design Choices (Production Defaults)
+
+**1. Tile Configuration (`config.py`):**
 ```python
-# Spatial Decimation
-JFA_TILE_SIZE = 32                   # Tile size in voxels
-JFA_QUIET_THRESHOLD = 0.01           # Max movement/radius change to stay "quiet"
-JFA_HALO_WIDTH = 2                   # Tiles around dirty region to refresh
+# Spatial Decimation (Dirty Tiles)
+JFA_DIRTY_TILES_ENABLED = True       # Master switch for spatial decimation
+JFA_TILE_SIZE = 16                   # Voxels per tile (sweet spot for cache locality)
+JFA_DIRTY_HALO = 1                   # Tile halo width (use 2 during warm-start)
+JFA_DIRTY_WARMSTART = True           # Disable dirty tiles during WARMSTART_FRAMES
+JFA_DIRTY_WATCHDOG_INTERVAL = 30     # Force full refresh every N frames
+JFA_DIRTY_ESCALATION_THRESHOLD = 0.6 # Promote to full if dirty% > 60%
 ```
 
-**2. Tile State Tracking (`jfa.py`):**
-```python
-# Add to JFAContext:
-self.tile_dirty = ti.field(dtype=ti.i32, shape=(tiles_x, tiles_y, tiles_z))
-self.tile_last_pos = ti.Vector.field(3, dtype=ti.f32, shape=MAX_N)
-self.tile_last_rad = ti.field(dtype=ti.f32, shape=MAX_N)
+**2. Dirty Criteria:**
+- **Movement:** Mark tile dirty if `|Δpos| > 0.5 * voxel_size` or particle crosses tile boundary
+- **Radius:** Mark tile dirty if `|Δr| > 0.25 * voxel_size` (power distance changes)
+- **Boundary hysteresis:** Add `0.1 * voxel_size` buffer before re-marking on tile edge oscillations
+
+**3. Halo Strategy:**
+- **Default:** Expand dirty set by `+1 tile` in all 6 directions before JFA
+- **Warm-start:** Use `+2 tiles` during first `WARMSTART_FRAMES`
+- **Low-dirty:** If `dirty% < 25%`, consider bumping halo to 2 if artifacts appear
+
+**4. Watchdog (Auto-escalate to Full JFA):**
+- **Periodic:** Force full JFA every `JFA_DIRTY_WATCHDOG_INTERVAL` frames (default: 30)
+- **High-dirty:** If `dirty% > 60%` for a frame, promote to full JFA
+- **High-FSC-delta:** If `|Δμ_FSC| > 5%` vs last full refresh, promote to full JFA
+
+**5. Integration with Existing:**
+- **Cadence:** Dirty tiles work *within* existing `JFA_CADENCE=5` (only on JFA frames)
+- **Adaptive res:** Dirty tiles + adaptive resolution are fully compatible
+- **EMA compatibility:** FSC EMA + hysteresis buffer occasional stale regions
+
+---
+
+### 📊 Telemetry Format
+
+```
+[JFA] tiles={dirty}/{total} ({pct:.1f}%), halo={h}, mode={selective|full}, time={ms}
+[FSC] μ={:.2f} σ={:.2f} Δμ={:.2f}% (vs last full)
 ```
 
-**3. Mark Dirty Tiles (before JFA):**
-```python
-@ti.kernel
-def mark_dirty_tiles(pos, rad, last_pos, last_rad, n, threshold):
-    for i in range(n):
-        moved = (pos[i] - last_pos[i]).norm() > threshold
-        resized = abs(rad[i] - last_rad[i]) > threshold
-        if moved or resized:
-            # Mark tile + halo as dirty
-            tile = world_to_tile(pos[i])
-            for dz in range(-HALO, HALO+1):
-                for dy in range(-HALO, HALO+1):
-                    for dx in range(-HALO, HALO+1):
-                        mark_tile_dirty(tile + (dx, dy, dz))
+**Optional diagnostics (every 30 frames):**
+```
+[Drift] mean|Δpos|={:.6f} mean|Δr|={:.6f} over N={active_n}
 ```
 
-**4. Selective JFA Rasterization:**
-```python
-# Only rasterize particles in/near dirty tiles
-# Only run flood passes on dirty tile boundaries
-```
+---
 
-**5. Update Last State:**
-```python
-@ti.kernel
-def update_tile_cache(pos, rad, last_pos, last_rad, n):
-    for i in range(n):
-        last_pos[i] = pos[i]
-        last_rad[i] = rad[i]
-```
+### ✅ Acceptance Criteria
 
-### Challenges
+**Correctness:**
+- [ ] After each forced full refresh, `μ_FSC` within ±0.1 of selective runs
+- [ ] `σ_FSC` within ±5% of selective runs
+- [ ] Visual appearance indistinguishable from full-domain JFA
+- [ ] No "stale seams" or artifacts at tile boundaries
 
-1. **Halo Region:** Need to refresh surrounding tiles to catch neighbors
-2. **Periodic Boundaries:** Tile wrapping logic
-3. **Cold Start:** First frame after reset needs full refresh
-4. **Memory:** Extra fields for tracking
+**Performance:**
+- [ ] When `dirty% ≤ 20-40%`, JFA time drops **2-4×** on selective frames
+- [ ] Overall FPS improves **3-6×** combined with cadence + adaptive res
+- [ ] Typical `dirty%` trends: 60% (early) → 40% (settling) → 10-20% (equilibrium)
 
-### Testing Strategy
+**Stability:**
+- [ ] Watchdog rarely promotes to full (< 5% of selective frames)
+- [ ] No runaway dirtiness (stays < 60% after warm-start)
+- [ ] PBC-correct tile wrapping (no edge artifacts)
 
-1. Implement with `JFA_SPATIAL_DECIMATION = False` flag
-2. Run side-by-side comparison (full vs spatial)
-3. Visual validation: no artifacts at tile boundaries
-4. Performance: measure speedup vs complexity cost
+---
 
-### Acceptance Criteria
+### ⚠️ Pitfalls & Solutions
 
-- [ ] Tile tracking implemented
-- [ ] Dirty marking logic correct (includes halo)
-- [ ] PBC-aware tile wrapping
-- [ ] No visual artifacts
-- [ ] FPS improvement of 2-3×
-- [ ] Configurable via flag (can disable)
-- [ ] Documented in README
+| Pitfall | Symptom | Solution |
+|---------|---------|----------|
+| **Tile-thrash at boundaries** | Sites oscillating on tile edges → permanent dirty | Add 0.1×voxel hysteresis before re-marking |
+| **Under-marking from tiny Δr** | Thin faces flip without being caught | Use radius threshold `0.25 * voxel_size` |
+| **Halo too small** | Visible seams at tile boundaries | Bump halo to 2 when `dirty% < 25%` |
+| **Runaway dirtiness** | `dirty% > 60%` for > 3 cycles | Drop cadence to 2, force full refresh, re-evaluate |
+| **PBC edge cases** | Particles near domain boundary cause artifacts | Wrap tile indices with same PBC logic as particles |
+
+---
+
+### 🧪 Rollout Sequence (Phased Implementation)
+
+#### **Phase A: Instrumentation (No Selective JFA Yet)**
+- [ ] Add tile grid and tracking fields to `jfa.py`
+- [ ] Add dirty marking kernel (movement + radius thresholds)
+- [ ] Print `[JFA] tiles={dirty}/{total} ({pct:.1f}%)` **without** changing JFA behavior
+- [ ] **Sanity check:** `dirty%` should trend down after warm-start (60% → 20%)
+
+#### **Phase B: Selective JFA (Enable with Watchdog)**
+- [ ] Modify `rasterize_seeds` to only write in dirty tiles
+- [ ] Modify `jfa_pass` to skip clean tiles
+- [ ] Modify `collect_faces` to only scan dirty tiles
+- [ ] Implement halo expansion (+1 tile in all directions)
+- [ ] Implement watchdog (full refresh every 30 frames)
+- [ ] **Validation:** FSC distribution matches full-domain runs (±5%)
+
+#### **Phase C: Tune & Optimize**
+- [ ] Adjust thresholds to keep `dirty%` typically 10-40%
+- [ ] Tune halo width based on observed artifacts
+- [ ] Add boundary hysteresis if tile-thrash detected
+- [ ] Implement escalation logic (high-dirty → full JFA)
+- [ ] **Performance:** Measure JFA time reduction vs dirty%
+
+---
+
+### 📈 Expected Outcomes (10k Particles, 192³ JFA Grid)
+
+| Scenario | Dirty % | JFA Time | Overall FPS | Speedup |
+|----------|---------|----------|-------------|---------|
+| **Startup (warm-start)** | 100% | ~170ms | ~8 FPS | 1.0× (baseline) |
+| **Early settling** | 40-60% | ~70-100ms | ~13-19 FPS | **1.6-2.4×** |
+| **Late equilibrium** | 10-20% | ~20-40ms | ~25-40 FPS | **3.1-5.0×** |
+
+**Combined with existing optimizations:**
+- Multi-rate cadence (5 frames): 2.4×
+- Adaptive resolution: 1.3× (geometric mean)
+- Dirty tiles: 3-5× (on selective frames)
+- **Total:** ~10-12× from baseline (~4 FPS → ~40-50 FPS)
+
+---
+
+### 🗺️ Future Multipliers (Post-Phase C)
+
+1. **Adaptive cadence by dirtiness:** If `dirty% < 10%`, skip JFA entirely (effective cadence → 10-12)
+2. **Incremental passes:** Only run late JFA passes in tiles whose labels changed after early passes
+3. **Seed raster pooling:** Cache seed IDs per tile; reuse when unchanged (reduces memory traffic)
+
+---
+
+### 🚀 Implementation Checklist
+
+**Files to Modify:**
+- [ ] `config.py`: Add dirty tile configuration constants
+- [ ] `jfa.py`: Add tile grid, tracking fields, dirty marking kernel
+- [ ] `jfa.py`: Modify `rasterize_seeds`, `jfa_pass`, `collect_faces` for selective execution
+- [ ] `run.py`: Call dirty marking before JFA, clear tiles after JFA, add telemetry
+
+**Testing:**
+- [ ] Phase A: Run with instrumentation, verify `dirty%` trends correct
+- [ ] Phase B: Enable selective JFA, verify FSC matches full-domain (±5%)
+- [ ] Phase C: Tune thresholds, measure FPS gain vs dirty%
+- [ ] Regression: Run 1000+ frames, verify no drift or artifacts
 
 ---
 

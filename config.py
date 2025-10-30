@@ -173,6 +173,23 @@ JFA_CADENCE = 5                   # Run JFA every N frames (after warm-start)
 JFA_WARMSTART_FRAMES = 30         # Force every-frame JFA during first N frames (topology stabilization)
 JFA_WATCHDOG_INTERVAL = 30        # Force full refresh every N JFA runs (catch drift)
 
+# ==============================================================================
+# JFA OPTIMIZATION: Spatial Decimation (Dirty Tiles) - Phase A: Instrumentation
+# ==============================================================================
+# Only re-compute JFA in regions where particles moved or radii changed
+# Expected gain: 2-6× on top of cadence + adaptive res (15-30 FPS total)
+JFA_DIRTY_TILES_ENABLED = False      # Master switch (Phase A: instrumentation only)
+JFA_TILE_SIZE = 16                   # Voxels per tile (sweet spot for cache locality)
+JFA_DIRTY_HALO = 1                   # Tile halo width (use 2 during warm-start)
+JFA_DIRTY_WARMSTART = True           # Disable dirty tiles during WARMSTART_FRAMES
+JFA_DIRTY_WATCHDOG_INTERVAL = 30     # Force full refresh every N frames
+JFA_DIRTY_ESCALATION_THRESHOLD = 0.6 # Promote to full if dirty% > 60%
+
+# Dirty criteria thresholds (relative to voxel size)
+JFA_DIRTY_POS_THRESHOLD = 0.5        # Mark dirty if |Δpos| > 0.5 * voxel_size
+JFA_DIRTY_RAD_THRESHOLD = 0.25       # Mark dirty if |Δr| > 0.25 * voxel_size
+JFA_DIRTY_BOUNDARY_HYSTERESIS = 0.1  # Buffer before re-marking tile edge oscillations
+
 # Precomputed constants (Python scope, compile-time folded by Taichi)
 HALF_L = 0.5 * DOMAIN_SIZE  # Half domain size for centered coordinates
 INV_L = 1.0 / DOMAIN_SIZE   # Inverse domain size (avoid repeated division)
