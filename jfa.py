@@ -100,6 +100,12 @@ face_counts = None        # Voxel count per pair (for normalization) [MAX_PARTIC
 face_ids = None           # Neighbor IDs for face_counts [MAX_PARTICLES, MAX_NEIGHBORS]
 neighbor_prev_scores = None  # Previous frame scores (for hysteresis) [MAX_PARTICLES, MAX_NEIGHBORS]
 
+# Phase 3 - Spatial Decimation (Dirty Tiles) fields
+tile_dirty = None         # Dirty flag per tile [tiles_x, tiles_y, tiles_z]
+pos_prev = None           # Cached particle positions from last JFA [MAX_PARTICLES]
+rad_prev = None           # Cached particle radii from last JFA [MAX_PARTICLES]
+tiles_per_axis = 0        # Computed dynamically based on JFA_RES and JFA_TILE_SIZE
+
 
 def init_jfa():
     """
@@ -110,6 +116,7 @@ def init_jfa():
     """
     global jfa_grid, jfa_temp, face_area, neighbor_list, neighbor_count, neighbor_used_count, fsc, fsc_ema, label_changes
     global label_filtered, face_counts, face_ids, neighbor_prev_scores, power_beta_current
+    global tile_dirty, pos_prev, rad_prev, tiles_per_axis
     
     # Voxel grid: stores (particle_id, squared_radius) per voxel
     # particle_id = -1 means unassigned
@@ -165,6 +172,27 @@ def init_jfa():
     # Initialize as a scalar field and set to default POWER_BETA value
     power_beta_current = ti.field(dtype=ti.f32, shape=())
     power_beta_current[None] = POWER_BETA
+    
+    # ========================================================================
+    # PHASE 3 - Spatial Decimation (Dirty Tiles) Fields
+    # ========================================================================
+    # NOTE: Tile dimensions are computed dynamically in set_resolution()
+    # Initial allocation uses JFA_RES_MAX to allow for dynamic resolution changes
+    
+    # Compute max tiles needed (for allocation at JFA_RES_MAX)
+    from config import JFA_TILE_SIZE
+    max_tiles = (JFA_RES_MAX + JFA_TILE_SIZE - 1) // JFA_TILE_SIZE
+    
+    # Dirty flag per tile (1 = dirty, needs JFA; 0 = clean, can skip)
+    tile_dirty = ti.field(dtype=ti.u8, shape=(max_tiles, max_tiles, max_tiles))
+    
+    # Cached particle state from last JFA run (for detecting changes)
+    pos_prev = ti.Vector.field(3, dtype=ti.f32, shape=MAX_PARTICLES)
+    rad_prev = ti.field(dtype=ti.f32, shape=MAX_PARTICLES)
+    
+    # Initial state: all tiles dirty (first frame needs full JFA)
+    # tiles_per_axis will be set by set_resolution()
+    tiles_per_axis = 0
 
 
 def set_resolution(new_res: int):
@@ -177,7 +205,7 @@ def set_resolution(new_res: int):
     Args:
         new_res: New JFA_RES value (will be clamped to [JFA_RES_MIN, JFA_RES_MAX])
     """
-    global JFA_RES, VOXEL_SIZE, JFA_NUM_PASSES
+    global JFA_RES, VOXEL_SIZE, JFA_NUM_PASSES, tiles_per_axis
     
     # Clamp resolution to valid range
     JFA_RES = max(JFA_RES_MIN, min(new_res, JFA_RES_MAX))
@@ -185,6 +213,10 @@ def set_resolution(new_res: int):
     # Recompute derived constants
     VOXEL_SIZE = L / JFA_RES
     JFA_NUM_PASSES = int(np.ceil(np.log2(JFA_RES))) + 1  # One extra for safety
+    
+    # Recompute tile dimensions for spatial decimation
+    from config import JFA_TILE_SIZE
+    tiles_per_axis = (JFA_RES + JFA_TILE_SIZE - 1) // JFA_TILE_SIZE
 
 
 # ============================================================================
@@ -265,6 +297,51 @@ def wrapP(diff: ti.math.vec3) -> ti.math.vec3:
         diff[0] - L * ti.round(diff[0] / L),
         diff[1] - L * ti.round(diff[1] / L),
         diff[2] - L * ti.round(diff[2] / L)
+    ])
+
+
+# ============================================================================
+# PHASE 3 - SPATIAL DECIMATION (DIRTY TILES) HELPER FUNCTIONS
+# ============================================================================
+
+@ti.func
+def world_to_tile(world_pos: ti.math.vec3) -> ti.math.ivec3:
+    """
+    Convert world position to tile index.
+    
+    Args:
+        world_pos: Position in world coordinates [-L/2, L/2]³
+    
+    Returns:
+        Tile index [0, tiles_per_axis)³
+    """
+    # First convert to voxel index
+    voxel_idx = world_to_voxel(world_pos)
+    
+    # Then convert to tile index (integer division)
+    from config import JFA_TILE_SIZE
+    return ti.math.ivec3([
+        voxel_idx[0] // JFA_TILE_SIZE,
+        voxel_idx[1] // JFA_TILE_SIZE,
+        voxel_idx[2] // JFA_TILE_SIZE
+    ])
+
+
+@ti.func
+def wrap_tile_idx(tile_idx: ti.math.ivec3) -> ti.math.ivec3:
+    """
+    Wrap tile index to handle Periodic Boundary Conditions (PBC).
+    
+    Args:
+        tile_idx: Tile index (may be out of bounds)
+    
+    Returns:
+        Wrapped index in [0, tiles_per_axis)³
+    """
+    return ti.math.ivec3([
+        (tile_idx[0] % tiles_per_axis + tiles_per_axis) % tiles_per_axis,
+        (tile_idx[1] % tiles_per_axis + tiles_per_axis) % tiles_per_axis,
+        (tile_idx[2] % tiles_per_axis + tiles_per_axis) % tiles_per_axis
     ])
 
 
@@ -873,6 +950,101 @@ def finalize_fsc(active_n: ti.i32):
         
         fsc[i] = fsc_count
         neighbor_count[i] = valid_neighbors
+
+
+# ============================================================================
+# PHASE 3 - SPATIAL DECIMATION (DIRTY TILES) KERNELS
+# ============================================================================
+
+@ti.kernel
+def mark_dirty_tiles(pos: ti.template(), rad: ti.template(), n: ti.i32):
+    """
+    Mark tiles as dirty based on movement and radius changes since last JFA.
+    
+    Dirty criteria:
+    - Position change: |Δpos| > JFA_DIRTY_POS_THRESHOLD * VOXEL_SIZE
+    - Radius change: |Δr| > JFA_DIRTY_RAD_THRESHOLD * VOXEL_SIZE
+    - Tile boundary crossing: particle moved to a different tile
+    
+    Marks the particle's current tile + halo tiles as dirty.
+    
+    Args:
+        pos: Current particle positions
+        rad: Current particle radii
+        n: Number of active particles
+    """
+    from config import (
+        JFA_DIRTY_POS_THRESHOLD, JFA_DIRTY_RAD_THRESHOLD,
+        JFA_DIRTY_HALO, JFA_TILE_SIZE
+    )
+    
+    for i in range(n):
+        # Check if particle has moved or radius changed significantly
+        pos_delta = (pos[i] - pos_prev[i]).norm()
+        rad_delta = ti.abs(rad[i] - rad_prev[i])
+        
+        pos_threshold = JFA_DIRTY_POS_THRESHOLD * VOXEL_SIZE
+        rad_threshold = JFA_DIRTY_RAD_THRESHOLD * VOXEL_SIZE
+        
+        # Compute current and previous tile indices
+        tile_curr = world_to_tile(pos[i])
+        tile_prev = world_to_tile(pos_prev[i])
+        
+        # Mark dirty if moved significantly, resized, or crossed tile boundary
+        is_dirty = (pos_delta > pos_threshold) or \
+                   (rad_delta > rad_threshold) or \
+                   (tile_curr[0] != tile_prev[0]) or \
+                   (tile_curr[1] != tile_prev[1]) or \
+                   (tile_curr[2] != tile_prev[2])
+        
+        if is_dirty:
+            # Mark current tile + halo as dirty (PBC-aware)
+            for dz in ti.static(range(-JFA_DIRTY_HALO, JFA_DIRTY_HALO + 1)):
+                for dy in ti.static(range(-JFA_DIRTY_HALO, JFA_DIRTY_HALO + 1)):
+                    for dx in ti.static(range(-JFA_DIRTY_HALO, JFA_DIRTY_HALO + 1)):
+                        tile_neighbor = wrap_tile_idx(tile_curr + ti.math.ivec3([dx, dy, dz]))
+                        tile_dirty[tile_neighbor[0], tile_neighbor[1], tile_neighbor[2]] = ti.u8(1)
+
+
+@ti.kernel
+def count_dirty_tiles() -> ti.i32:
+    """
+    Count the number of dirty tiles.
+    
+    Returns:
+        Number of tiles marked as dirty
+    """
+    count = ti.cast(0, ti.i32)
+    for tz, ty, tx in ti.ndrange(tiles_per_axis, tiles_per_axis, tiles_per_axis):
+        if tile_dirty[tx, ty, tz] == ti.u8(1):
+            count += 1
+    return count
+
+
+@ti.kernel
+def clear_dirty_tiles():
+    """
+    Clear all dirty tile flags (set to 0 = clean).
+    Call this after a full JFA refresh or at the start of warm-start.
+    """
+    for tz, ty, tx in ti.ndrange(tiles_per_axis, tiles_per_axis, tiles_per_axis):
+        tile_dirty[tx, ty, tz] = ti.u8(0)
+
+
+@ti.kernel
+def update_tile_cache(pos: ti.template(), rad: ti.template(), n: ti.i32):
+    """
+    Update cached particle state (positions and radii) for next frame's dirty marking.
+    Call this after JFA completes.
+    
+    Args:
+        pos: Current particle positions
+        rad: Current particle radii
+        n: Number of active particles
+    """
+    for i in range(n):
+        pos_prev[i] = pos[i]
+        rad_prev[i] = rad[i]
 
 
 # ============================================================================
