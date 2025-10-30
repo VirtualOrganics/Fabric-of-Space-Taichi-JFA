@@ -729,8 +729,11 @@ while window.running:
                 # Diagnostic telemetry every EQ_DEBUG_EVERY frames
                 if (frame % EQ_DEBUG_EVERY) == 0:
                     rmin, rmax, sigma_p = compute_pressure_stats(int(active_n), rad, float(PRESSURE_EXP), float(R_MIN), float(R_MAX))
+                    # Also compute σ(r) in fp64 for comparison (will be non-zero even if σ(P) underflows)
+                    rad_np = rad.to_numpy()[:active_n]
+                    sigma_r = float(np.std(rad_np, dtype=np.float64))
                     print(f"[EQ Debug] max|Δr|={max_abs_dr:.8f} | changed={changed}/{active_n}")
-                    print(f"[Pressure] r_min={rmin:.6f} r_max={rmax:.6f} σ(P)={sigma_p:.6f}")
+                    print(f"[Pressure] r_min={rmin:.6f} r_max={rmax:.6f} σ(r)={sigma_r:.8f} σ(P)={sigma_p:.6f}")
             
             # HUD update (≈10Hz)
             if frame % 6 == 0:
