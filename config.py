@@ -17,7 +17,7 @@ import math
 # Particle properties
 # ==============================================================================
 
-N = 10000                    # Total number of particles (target mean degree ~5-6)
+N = 10000                   # Total number of particles (target mean degree ~5-6)
 DOMAIN_SIZE = 0.189         # Cubic domain side length (SCALE WITH N - see table below)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -46,9 +46,9 @@ R_MAX_FACTOR = 10.0         # r_max = R_MAX_FACTOR * r_ref (10x larger than ref)
 CELL_SIZE_OVERRIDE = None
 
 # Manual bounds (used when AUTO_SCALE_RADII = False, which is the default)
-R_MIN_MANUAL = 0.0005       # Minimum particle radius (hard lower bound)
-R_MAX_MANUAL = 0.0500       # Maximum particle radius (hard upper bound - 100x spread)
-R_START_MANUAL = 0.003              #                Starting radius for all particles (uniform seeding)
+R_MIN_MANUAL = 0.002        # Minimum particle radius
+R_MAX_MANUAL = 0.010        # Maximum particle radius
+R_START_MANUAL = 0.0045     # Starting radius for all particles (raised to ensure initial contact)
                             # System will naturally create size distribution via growth/shrink
                             # Tuning: Increase if particles don't touch initially (no growth)
                             #         Decrease if too much overlap at startup (slow PBD)
@@ -57,6 +57,105 @@ R_START_MANUAL = 0.003              #                Starting radius for all par
 PBC_ENABLED = True          # Toggle periodic boundaries (compile-time via ti.static)
                             # True: particles wrap at domain edges (toroidal topology)
                             # False: bounded domain [0, L)³ (particles can hit walls)
+
+# ==============================================================================
+# JFA Power Diagram (Experimental)
+# ==============================================================================
+
+# === MANUAL CONTROL MODE ===
+# When True: Sliders directly control growth/shrink every frame (±5%)
+# No phases, no auto-calibration, no hidden transitions
+# Pure FSC-based pump: FSC < low → grow, FSC > high → shrink
+# PHASE 2: Manual pump with immediate feedback (no gates, no smoothing)
+FSC_MANUAL_MODE = True
+
+# Feature flag: Enable JFA-based Face-Sharing Count (FSC) for neighbor detection
+# When enabled, JFA runs in parallel with the existing grid system for validation
+# FSC replaces degree-based coloring, but PBD still uses the spatial hash grid
+JFA_ENABLED = True  # Re-enabled - with adaptive grid + gating, should work now
+
+# JFA run frequency: run JFA every N measurement frames (0 = every frame)
+# Higher values reduce overhead but delay FSC updates  
+# Manual mode: run every frame for immediate feedback
+JFA_RUN_INTERVAL = 1        # Run JFA every measurement frame (1 = every frame for manual mode)
+JFA_EMA_ALPHA = 0.33         # EMA smoothing factor for FSC (1/cadence for stable convergence)
+
+# ==============================================================================
+# FSC-Only Controller (Phase 2)
+# ==============================================================================
+# Controller uses Face-Sharing Count (FSC) from JFA Power Diagram to control
+# particle sizing. All control is derived solely from FSC—no geometric degree.
+
+# --- Core FSC control ---
+FSC_LOW = 8                 # FSC lower bound (grow below this)
+FSC_HIGH = 20               # FSC upper bound (shrink above this)
+GROWTH_PCT = 0.10           # 10% per measurement cycle (increased for faster response)
+ADJUSTMENT_FRAMES = 15      # frames to ~95% (adaptive EMA, reduced for faster convergence)
+
+# --- Safety rails ---
+MAX_STEP_PCT = 0.12         # Per-frame cap on |ΔR|/R
+MAX_STEP_PCT_RANGE = (0.05, 0.20)  # GUI slider range for advanced users
+
+# --- Appendix A (opt-in refinements) ---
+FSC_DEADBAND = 1.0          # ±FSC units near band edges (smoothstep damping)
+BACKPRESSURE_MODE = "local" # "local" | "global" | "off"
+RUN_SAFETY_TESTS = False    # Enable radius bounds assertions during testing
+
+# ==============================================================================
+# PRESSURE EQUILIBRATION
+# ==============================================================================
+# Volume-conserving pressure diffusion across FSC neighbors.
+# Complements FSC controller: FSC drives long-term topology, pressure balances
+# local mechanics. Equilibration is the primary driver of foam dynamics.
+
+PRESSURE_EQUILIBRATION_ENABLED = True   # Master switch for pressure equilibration
+PRESSURE_K = 0.10                       # Base diffusion coefficient (increased for visible dynamics)
+PRESSURE_EXP = 3.0                      # Volume exponent (3 for 3D, 2 for 2D)
+PRESSURE_PAIR_CAP = 0.02                # Per-pair ΔV cap (fraction of min(V_i, V_j))
+MAX_EQ_NEI = 10                         # Max neighbors equilibrated per site per frame
+EQ_MICRO_PBD_ITERS = 1                  # Micro-PBD iterations after equilibration (if needed)
+EQ_OVERLAP_THRESHOLD = 0.05             # Normalized penetration depth to trigger micro-PBD
+
+# ==============================================================================
+# BROWNIAN MOTION (keeps foam "breathing" at equilibrium)
+# ==============================================================================
+BROWNIAN_ENABLED = True                 # Enable thermal jitter to prevent static equilibrium
+BROWNIAN_STRENGTH = 0.0002              # Velocity noise strength (adjust for visible motion)
+BROWNIAN_DAMPING = 0.95                 # Velocity damping per frame (0.95 = 5% friction)
+
+# ==============================================================================
+# WARM-START & DEBUG (prevents FSC=0 runaway during startup)
+# ==============================================================================
+WARMSTART_FRAMES = 30                   # Frames to let JFA stabilize before controller acts
+FSC_ZERO_RATE_THRESH = 0.10             # If >10% have FSC==0, keep growth off
+
+# Equilibration debug (prints every N frames)
+EQ_DEBUG_EVERY = 30                     # Show [EQ Debug] telemetry every N frames
+                                        # Formula: max(0, (Ra+Rb-d)/(Ra+Rb)) > threshold
+
+# JFA Configuration (Phase 2 fixes)
+# ==============================================================================
+
+# Power diagram weight: distance metric = d² - (β·r)²
+# β = 1.0 gives standard Power diagram (radius-weighted Voronoi)
+# β > 1.0 inflates particle influence (more aggressive weighting)
+# β < 1.0 deflates particle influence (closer to unweighted Voronoi)
+POWER_BETA = 1.0            # Start with standard Power diagram
+
+# Minimum face voxel count to accept a neighbor relationship
+# This threshold filters out spurious 1-voxel "faces" caused by label noise
+# Typical values: 8-16 voxels for 128³ resolution with r_mean ~ 0.005
+# Lower = more permissive (risk of false positives)
+# Higher = more strict (risk of missing true neighbors)
+# Manual mode: very permissive to guarantee non-zero FSC during debugging
+MIN_FACE_VOXELS = 2         # Threshold for accepting face-sharing neighbors (permissive for manual mode)
+
+# Dynamic resolution bounds: JFA_RES will be computed as L / voxel_size
+# where voxel_size ≈ 2.5-3.0 × r_mean (mean particle radius)
+# This ensures voxels are sized appropriately relative to particles
+JFA_RES_MIN = 192           # Minimum grid resolution (per Perplexity: need ≥10 voxels/diameter)
+JFA_RES_MAX = 320           # Maximum grid resolution (per Perplexity: 16 voxels/diameter = reliable)
+JFA_VOXEL_SCALE = 2.8       # Voxel size = VOXEL_SCALE × r_mean (tune 2.5-3.0)
 
 # Precomputed constants (Python scope, compile-time folded by Taichi)
 HALF_L = 0.5 * DOMAIN_SIZE  # Half domain size for centered coordinates
@@ -100,9 +199,9 @@ def compute_radius_bounds(N, phi_target, domain_size, r_min_factor, r_max_factor
 # Contact tolerance (must be defined before CELL_SIZE calculation)
 # ==============================================================================
 
-CONTACT_TOL = 0.015         # Contact tolerance: 1.5% beyond touching
-                            # Matches PBD GAP_FRACTION. Particles at (1+TOL)*(r_i+r_j) 
-                            # are counted as neighbors.
+CONTACT_TOL = 0.035         # Contact tolerance: 3.5% beyond touching
+                            # Set to 3.5% based on measured miss margin of 2.73% (with margin for safety).
+                            # Particles at (1+TOL)*(r_i+r_j) are counted as neighbors.
 
 # ==============================================================================
 # Apply auto-scaling or use manual bounds (with contact-aware cell sizing)
@@ -137,11 +236,11 @@ else:
     # At steady state, typical size is ~R_TYPICAL ≈ 0.005-0.010
     # At maximum, particles can reach R_MAX = 0.050
     # 
-    # TEMPORARY: Revert to a safe baseline for debugging
-    # Use a moderately-sized cell to avoid extremes
-    R_TYPICAL = 0.010  # Typical particle size during simulation  
+    # Coarse grid for efficient neighbor detection
+    # Target: cell_size ≈ r_cut so reach stays small (2-3, not 10+)
+    R_TYPICAL = 0.015  # Typical max particle size during simulation (updated from telemetry)
     r_cut_typical = 2.0 * (1.0 + CONTACT_TOL) * R_TYPICAL
-    CELL_SIZE = 0.030  # Fixed size for debugging - should give reach≈1 at typical sizes
+    CELL_SIZE = r_cut_typical  # cell_size ≈ r_cut → GRID_RES ≈ 6³, reach ≈ 2
     R_REF = None  # Not computed
     
     print(f"[DEBUG] CELL_SIZE={CELL_SIZE:.6f}, r_cut_typical={r_cut_typical:.6f}")
@@ -177,11 +276,11 @@ EPS = 1e-8                  # Small epsilon for numerical safety
 # ==============================================================================
 
 DEG_LOW = 3                 # Below this: grow by GAIN_GROW (geometric PCC)
-DEG_HIGH = 5                # Above this: shrink by GAIN_SHRINK
+DEG_HIGH = 5                # Above this: shrink by GAIN_SHRINK (μ≈5.8 should shrink!)
                             # In [DEG_LOW, DEG_HIGH]: no change
 
-GAIN_GROW = 0.03            # Growth rate: 3% per step (slightly faster, still stable)
-GAIN_SHRINK = 0.03          # Shrink rate: 3% per step
+GAIN_GROW = 0.05            # Growth rate: 5% per step (increased for visibility)
+GAIN_SHRINK = 0.05          # Shrink rate: 5% per step (increased for visibility)
 
 # ==============================================================================
 # PBD separation (overlap projection) - Track 1 (Fast Path)

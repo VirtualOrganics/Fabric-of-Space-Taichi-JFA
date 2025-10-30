@@ -5,16 +5,11 @@ __pycache__/
 *.so
 .Python
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 ENV/
-
-# Output files
-output/
-*.csv
-*.ply
-*.obj
+.venv
 
 # IDE
 .vscode/
@@ -26,3 +21,15 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+
+# Project-specific
+*.pdf
+test_*.py
+run.sh
+
+# Taichi cache
+.taichi_cache/
+
+# Temporary files
+*.tmp
+*.log

@@ -1,417 +1,312 @@
-# 🧩 Fabric of Space - Custom Taichi Grid
+# Fabric of Space - FSC-Only Foam Simulator
 
-**Dynamic Voronoi Foam — Phase B (Growth Rhythm + Lévy Diffusion)**
+A real-time GPU-accelerated foam simulation driven purely by topological (Face-Sharing Count) properties, implemented in Taichi. This simulator models 3D foam behavior using power diagrams and pressure equilibration, with continuous dynamics and live interactive control.
 
----
+![Foam Simulation](https://img.shields.io/badge/Python-3.9+-blue.svg)
+![Taichi](https://img.shields.io/badge/Taichi-1.7.0+-orange.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## 🌌 Overview
+## 🌟 Features
 
-This simulator models a dynamic 3D foam composed of thousands of interacting spherical "cells."
-Each cell has a radius *r*ᵢ and a position *p*ᵢ, and together they form a smoothed-particle approximation of a Voronoi / power diagram.
+### Core Simulation
+- **FSC-Only Control**: Radius adaptation driven solely by Face-Sharing Count (FSC) from power diagrams
+- **Pressure Equilibration**: Volume-conserving pressure diffusion across topologically connected neighbors
+- **Hysteresis + EMA Lag**: Advanced controller preventing "frozen equilibrium" deadband lock
+- **Continuous Dynamics**: Foam remains dynamically active even at equilibrium through micro-nudging
+- **Periodic Boundary Conditions**: Seamless wrapping for infinite-domain behavior
 
-The foam evolves toward a balanced topology where each cell maintains a target degree band (number of neighbors) while staying overlap-free.
-**Phase B** introduces **temporal separation** and **topological relaxation** for stable, lifelike evolution at real-time frame rates.
+### Technical Implementation
+- **Jump Flood Algorithm (JFA)**: Efficient GPU-accelerated power diagram computation on voxel grids
+- **Position-Based Dynamics (PBD)**: Robust overlap resolution with adaptive iteration count
+- **Adaptive EMA Smoothing**: Gradual radius changes with per-frame caps and backpressure
+- **Brownian Motion**: Thermal jitter to maintain continuous "breathing" behavior
+- **Warm-start Mechanism**: Prevents FSC=0 runaway during startup
 
----
-
-## 🚀 Key Features (Phase B)
-
-### 1️⃣ Discrete Growth Rhythm
-
-Instead of continuous chaotic updates, growth now happens in **pulses**:
-
-| Phase | What happens | Duration |
-|-------|-------------|----------|
-| **Pulse Frame** | Count neighbors → apply one ±Δr step | 1 frame |
-| **Relax Window** | No counting or growth; only motion + Lévy | `RELAX_INTERVAL` frames |
-| **Idle** | PBD only, until next pulse | `GROWTH_INTERVAL` frames |
-
-This gives every process time to settle before the next measurement.
-
----
-
-### 2️⃣ Runtime GUI Sliders
-
-Interactive control panel (left panel) with **no snap-back**:
-
-| Slider | Range | Effect |
-|--------|-------|--------|
-| **Growth rate per pulse** | 0.01 – 0.10 | Percentage radius change (±) on each pulse |
-| **Frames between pulses** | 5 – 120 | Controls pulse frequency |
-| **Relax frames after pulse** | 0 – 60 | Time for foam to settle before next measurement |
-
-Sliders modify live Taichi 0-D fields (`grow_rate_rt`, `grow_interval_rt`, `relax_interval_rt`) that the kernels read every frame.
+### Visualization & Control
+- **Live GUI Sliders**: Real-time adjustment of FSC band, growth rate, and timing parameters
+- **Heatmap Coloring**: Radius-based color coding (red=large, cyan=small, yellow=mid-range)
+- **Freeze-Frame Validator**: Diagnostic tool for PBC and grid integrity
+- **Comprehensive Telemetry**: FSC stats, distribution, pressure metrics, and performance monitoring
 
 ---
 
-### 3️⃣ Lévy Positional Diffusion (Topological Regularization)
+## 🚀 Quick Start
 
-During the **relax window only**, particles undergo a smooth positional diffusion:
-
-```
-Δpᵢ = α · Σⱼ clamp((dⱼ - dᵢ) / span, -1, 1) · (pⱼ - pᵢ)
-```
-
-- Runs **only during relax frames** (not during growth)
-- Uses smoothed degree values (`deg_smoothed`)
-- Step clamped to `LEVY_STEP_FRAC × mean_radius`
-- Periodic-boundary-safe (PBC-aware shifts)
-
-**Typical parameters** (in `config.py`):
-
-```python
-LEVY_ENABLED = True
-LEVY_ALPHA = 0.04
-LEVY_DEG_SPAN = 10.0
-LEVY_STEP_FRAC = 0.15
-LEVY_USE_TOPO_DEG = False  # set True once Gabriel topology is restored
-```
-
----
-
-### 4️⃣ Automatic Rate-Limit Enforcement
-
-The radius-update kernel now receives a **runtime rate-limit parameter**:
-
-```python
-rate_limit_rt = max(RADIUS_RATE_LIMIT, grow_rate_rt[None])
-update_radii_xpbd(grow_rate_rt[None], rate_limit_rt, …)
-```
-
-Ensures visible growth even when GUI rate > static limit.
-
----
-
-### 5️⃣ Detailed Per-Pulse Telemetry
-
-Each pulse prints a structured report:
-
-```
-[Pulse] frame=180 | rate=0.060 gap=18 relax=12
-        deg: μ=5.89 [1,14]
-        r_mean: 0.004743 → 0.004921 (Δ=+0.000178, +3.75%)
-        clipped: 28/5000 (0.6%) [min=8 max=20]
-        max_depth=0.000156, passes=4
-```
-
-**Meaning:**
-- **rate/gap/relax**: active GUI settings
-- **deg μ[min,max]**: neighbor count stats
-- **r_mean**: average radius before/after pulse
-- **clipped**: fraction hitting min/max bounds
-- **max_depth/passes**: PBD load after pulse
-
----
-
-## 🧠 Temporal Architecture (Loop Order)
-
-```python
-if pulse_timer <= 0:
-    rebuild_grid()
-    count_neighbors()
-    update_radii_xpbd(grow_rate_rt, rate_limit_rt)
-    relax_timer = relax_interval_rt
-    pulse_timer = grow_interval_rt
-else:
-    pulse_timer -= 1
-
-project_overlaps()  # PBD every frame
-
-if relax_timer > 0:
-    relax_timer -= 1
-    if LEVY_ENABLED:
-        compute_mean_radius()
-        smooth_degree()
-        levy_position_diffusion()
-```
-
----
-
-## ⚙️ Default Parameters (`config.py`)
-
-```python
-DEG_LOW, DEG_HIGH = 3, 5          # target neighbor band
-RADIUS_RATE_LIMIT = 0.015         # absolute per-frame cap
-GROWTH_RATE_DEFAULT = 0.04        # 4% per pulse
-GROWTH_INTERVAL_DEFAULT = 20      # frames between pulses
-RELAX_INTERVAL_DEFAULT = 10       # relax frames
-LEVY_ALPHA = 0.04                 # diffusion strength
-LEVY_STEP_FRAC = 0.15             # max step size
-```
-
----
-
-## 📊 Tuning Guide
-
-| Goal | rate | gap | relax | Notes |
-|------|------|-----|-------|-------|
-| **Stable, alive** | 0.04 | 20 | 10 | Default balance |
-| **Faster compression** | 0.06 – 0.08 | 15 – 18 | 12 – 14 | Increases motion pressure |
-| **Smoother** | 0.03 | 25 | 15 | Softer convergence |
-
-**Monitor:**
-- **deg μ** → should drift toward 3–5 (or your custom band)
-- **r_mean** → oscillates gently around steady state
-- **max_depth** → stays < 0.001
-- **FPS** ≈ 100–120 for N ≈ 5000
-
----
-
-## 🖥️ Quick Start
+### Prerequisites
+- Python 3.9 or higher
+- GPU with Vulkan/CUDA/Metal support (recommended for performance)
 
 ### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/VirtualOrganics/Fabric-of-Space-Taichi.git
-cd Fabric-of-Space-Taichi
+git clone https://github.com/VirtualOrganics/Fabric-of-Space-Taichi-JFA.git
+cd Fabric-of-Space-Taichi-JFA
 
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-### Run Simulation
+### Running the Simulation
 
-**Option 1: Using the launch script (recommended)**
 ```bash
-./run.sh
+python run.py
 ```
 
-**Option 2: Manual activation**
+The simulation window will open showing 10,000 particles in a periodic 3D domain.
+
+---
+
+## 🎮 Controls
+
+### Keyboard
+- **Space**: Pause/Resume simulation
+- **R**: Reset particles to random positions
+- **F**: Freeze-frame diagnostic test (validates PBC & grid integrity)
+- **Q** or **Escape**: Quit simulation
+
+### GUI Sliders
+- **FSC Low/High**: Set the target topological connectivity band
+  - Particles below `FSC_LOW` grow
+  - Particles above `FSC_HIGH` shrink
+  - Particles in-band receive micro-nudges toward band center
+- **Growth/Shrink Rate**: Adjust size change percentage per cycle
+- **Starting Radius**: Set initial particle size for resets
+- **Min/Max Radius**: Clamp particle size range
+
+---
+
+## 📊 Understanding the Output
+
+### Telemetry (Console)
+```
+[JFA Measurement] frame=320
+  FSC: μ=12.2 [8,18] | band=[11,12]
+  Distribution: grow=645 (6.5%) | in-band=5699 (57.0%) | shrink=3656 (36.6%)
+  r_mean: 0.003843 → target=0.003768
+  Settling for 15 frames...
+[EQ Debug] max|Δr|=0.00005985 | changed=9139/10000
+[Pressure] r_min=0.004088 r_max=0.004760 σ(P)=0.000000
+```
+
+**Interpretation:**
+- **FSC μ=12.2**: Mean Face-Sharing Count across all particles
+- **band=[11,12]**: Target FSC range (narrow band = tight topological control)
+- **Distribution**: Percentage of particles growing/holding/shrinking
+- **r_mean → target**: Current mean radius and target after controller action
+- **max|Δr|**: Maximum radius change from pressure equilibration
+- **changed**: Number of particles adjusted by pressure equilibrator
+
+### Visual Heatmap
+- **Red/Orange**: Large particles (high pressure, shrinking)
+- **Cyan/Blue**: Small particles (low pressure, growing)
+- **Yellow/Green**: Mid-range particles (near equilibrium, micro-nudging)
+
+---
+
+## 🔬 Technical Details
+
+### Architecture
+
+The simulator consists of two complementary control channels:
+
+1. **FSC Controller (Slow/Global)**
+   - Drives system toward target topological connectivity
+   - Uses hysteresis and EMA-lagged FSC for decisions
+   - Prevents deadband lock with continuous micro-nudges
+   - Updates: Every measurement frame (~15-30 frames)
+
+2. **Pressure Equilibrator (Fast/Local)**
+   - Balances pressure across FSC-connected neighbors
+   - Volume-conserving Jacobi iteration
+   - Creates mechanical consistency
+   - Updates: Every frame
+
+### Key Algorithms
+
+#### Jump Flood Algorithm (JFA)
+Computes power diagrams (weighted Voronoi tessellations) on a 192³ voxel grid:
+1. Initialize grid with particle IDs and weights
+2. Parallel flood passes (stride halving: 64, 32, 16, ...)
+3. Face detection via Minkowski bisector witness tests
+4. FSC extraction from detected faces
+
+#### Hysteresis + EMA Lag Controller
+Prevents frozen equilibrium through:
+- **EMA decisions**: Use smoothed FSC (temporal lag) instead of raw FSC
+- **Hysteresis gap**: ±1 FSC buffer zones for smooth transitions
+- **Idle micro-nudge**: 0.3% drift toward band center when in-band
+
+#### Pressure Equilibration
+Volume-conserving diffusion across shared faces:
+```
+ΔV_ij = κ (V_i - V_j)  [capped per-pair]
+V_i' = V_i - ΔV_ij
+V_j' = V_j + ΔV_ij
+r' = V'^(1/3)
+```
+
+---
+
+## ⚙️ Configuration
+
+Key parameters in `config.py`:
+
+### Simulation
+```python
+MAX_N = 50000              # Maximum particle capacity
+DOMAIN_SIZE = 0.189        # Periodic cube side length
+R_START_MANUAL = 0.004     # Initial radius
+R_MIN = 0.002              # Minimum radius clamp
+R_MAX = 0.010              # Maximum radius clamp
+```
+
+### FSC Controller
+```python
+FSC_LOW = 8                # FSC lower bound (grow below)
+FSC_HIGH = 20              # FSC upper bound (shrink above)
+GROWTH_PCT = 0.10          # 10% per measurement cycle
+ADJUSTMENT_FRAMES = 15     # Frames to ~95% convergence
+```
+
+### Pressure Equilibration
+```python
+PRESSURE_EQUILIBRATION_ENABLED = True
+PRESSURE_K = 0.10          # Diffusion coefficient
+PRESSURE_EXP = 3.0         # Volume exponent (3 for 3D)
+PRESSURE_PAIR_CAP = 0.02   # Per-pair ΔV cap (fraction)
+MAX_EQ_NEI = 10            # Max neighbors per frame
+```
+
+### Brownian Motion
+```python
+BROWNIAN_ENABLED = True
+BROWNIAN_STRENGTH = 0.0002 # Velocity noise strength
+BROWNIAN_DAMPING = 0.95    # Velocity damping (5% friction)
+```
+
+---
+
+## 🧪 Testing & Validation
+
+### Freeze-Frame Test (Press F)
+Validates:
+- ✅ CSR grid integrity (every particle assigned to exactly one cell)
+- ✅ PBC correctness (all particles within primary cell)
+- ✅ No spatial hash collisions
+
+### Expected Behavior
+- **Narrow band** (e.g., [11,12]): Active dynamics, most particles shrinking
+- **Wide band** (e.g., [8,20]): Gentle dynamics, most particles in-band
+- **Slider response**: Changes take effect within 1-2 measurement cycles
+- **Continuous motion**: System never fully freezes, even at equilibrium
+
+---
+
+## 📁 Project Structure
+
+```
+Fabric-of-Space-Taichi-JFA/
+├── run.py              # Main simulation loop, GUI, telemetry
+├── config.py           # Global constants and parameters
+├── dynamics.py         # Controllers, PBD, pressure equilibration
+├── grid.py             # CSR spatial hashing, PBC helpers
+├── jfa.py              # Jump Flood Algorithm, power diagrams
+├── topology.py         # Topological utilities (legacy)
+├── requirements.txt    # Python dependencies
+├── tests/
+│   └── test_jfa.py    # JFA unit tests
+└── docs/              # Additional documentation (blueprints)
+```
+
+---
+
+## 🎯 Design Philosophy
+
+### Why FSC-Only?
+Geometric degree (distance-based neighbor counting) is unreliable and drifts with tolerance, timing, and packing noise. FSC (Face-Sharing Count from power diagrams) is a **topological** metric that directly measures cell connectivity, making it stable, scale-invariant, and physically meaningful.
+
+### Wet vs. Dry Foam
+- **Visual "wet" spheres**: Minkowski spheres with gaps (for rendering)
+- **Underlying "dry" mesh**: Power diagram where faces imply contact
+- **Pressure equilibration**: Bridges the two, ensuring visual consistency with topological constraints
+
+### Two-Channel Control
+- **FSC controller**: Sets long-term topological structure (target FSC band)
+- **Pressure equilibrator**: Ensures local mechanical consistency (pressure balance)
+- **Independence**: They run at different cadences and operate on different metrics
+
+---
+
+## 🐛 Known Issues & Limitations
+
+### σ(P) Telemetry (fp32 Underflow)
+- **Issue**: Pressure variance (`σ(P)`) reports `0.000000` due to fp32 precision limits
+- **Impact**: Diagnostic only; equilibrator is working (evidenced by `changed=9139/10000`)
+- **Fix**: Implement Welford's algorithm with fp64 accumulators (pending)
+
+### JFA Asymmetry
+- **Issue**: JFA validation reports high asymmetry percentage (180-220%)
+- **Impact**: Known artifact of voxelized face detection; does not affect stability
+- **Status**: Validation check relaxed (warning only)
+
+### Resolution Scaling
+- **Issue**: Very small or very large particle counts may require JFA resolution tuning
+- **Workaround**: Adjust `JFA_RES_MIN` and `JFA_RES_MAX` in `config.py`
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.
+
+### Development Setup
 ```bash
-source venv/bin/activate
-python3 run.py
-deactivate  # when done
+# Install development dependencies
+pip install -r requirements.txt
+
+# Run tests
+python -m pytest tests/
 ```
-
-### Controls
-
-- **Right-click + drag**: Rotate camera
-- **Mouse wheel**: Zoom in/out
-- **WASD**: Move camera
-- **SPACE**: Pause/Resume simulation
-- **S**: Export particle data (CSV)
-- **ESC**: Exit
-
-### GUI Panel
-
-- **Particle Count**: Adjust N and restart simulation
-- **Degree Stats**: View distribution and adjust band thresholds
-- **Radius Limits**: Set min/max bounds
-- **Growth Rhythm**: Control rate, gap, and relax (live, no snap-back!)
-- **Visualization**: Toggle center-point vs. full-sphere rendering
 
 ---
 
-## 🧪 Quick Start for Developers
+## 📚 References
 
-### Project Structure
+1. **Lévy et al.** - "Large-scale semi-discrete optimal transport" (2024)  
+   arXiv:2406.04192 - Inspiration for pressure diffusion across dual graph
 
-```
-Cursor_FoS-Custom-Grid/
-├── config.py          # All simulation parameters
-├── grid.py            # Spatial hashing and neighbor detection
-├── dynamics.py        # Radius adaptation, PBD, Lévy diffusion
-├── topology.py        # Gabriel graph topology analysis (Phase B)
-├── run.py             # Main loop, GUI, and visualization
-├── run.sh             # Launch script
-├── requirements.txt   # Python dependencies
-└── venv/              # Virtual environment (created during setup)
-```
+2. **Rong, Bao, Chen** - "Taichi: A Language for High-Performance Computation on Spatially Sparse Data Structures" (2019)  
+   ACM SIGGRAPH Asia
 
-### Dependencies
-
-- **Python**: 3.8+ (tested on 3.13)
-- **Taichi**: 1.7.0+ (GPU-accelerated, Metal/CUDA/Vulkan)
-- **NumPy**: 1.24.0+ (array operations)
-
-### Configuration Quick Reference
-
-Edit `config.py` to customize:
-
-**Particle Properties:**
-```python
-N = 5000                    # Number of particles
-DOMAIN_SIZE = 0.15          # Cubic domain size
-R_MIN, R_MAX = 0.0020, 0.0080  # Radius bounds
-```
-
-**Degree Adaptation:**
-```python
-DEG_LOW, DEG_HIGH = 3, 5    # Target neighbor band
-GAIN_GROW, GAIN_SHRINK = 0.03, 0.03  # Growth/shrink rate
-```
-
-**PBD Separation:**
-```python
-PBD_BASE_PASSES = 4         # Minimum PBD passes per frame
-PBD_MAX_PASSES = 8          # Maximum (adaptive scaling)
-GAP_FRACTION = 0.015        # Target separation cushion
-```
-
-**Growth Rhythm:**
-```python
-GROWTH_RATE_DEFAULT = 0.04     # 4% per pulse
-GROWTH_INTERVAL_DEFAULT = 20   # Frames between pulses
-RELAX_INTERVAL_DEFAULT = 10    # Relax window duration
-```
-
-**Lévy Diffusion:**
-```python
-LEVY_ENABLED = True         # Toggle positional diffusion
-LEVY_ALPHA = 0.04           # Diffusion strength
-LEVY_STEP_FRAC = 0.15       # Max step size (fraction of mean radius)
-```
-
-**Periodic Boundaries:**
-```python
-PBC_ENABLED = True          # Toggle periodic boundaries
-```
-
-### Run Options
-
-**Standard run:**
-```bash
-python3 run.py
-```
-
-**With performance profiling (built-in):**
-- Console logs every 60 frames: grid, PBD, topology, render timings
-- Pulse logs every pulse: degree, radius, clipped%, depth, passes
-
-**Export data:**
-- Press **S** during simulation to export CSV snapshot
-- File: `particle_data_frame_N.csv` (ID, X, Y, Z, Radius, Degree)
-
-### Development Tips
-
-1. **Fast iteration**: Lower `N` to 1000 for quick testing
-2. **Debug PBD**: Watch `max_depth` and `passes` in console logs
-3. **Tune rhythm**: Use GUI sliders for live experimentation
-4. **Profile GPU**: Taichi's `ti.profiler` tools available (see Taichi docs)
-5. **Test PBC**: Set `PBC_ENABLED = False` to compare bounded vs. periodic
-
----
-
-## 🔬 Architecture Details
-
-### Spatial Hashing Grid
-
-- **Cell size**: `2 × R_MAX` (conservative, ensures all pairs detected)
-- **Grid resolution**: `GRID_RES³` (e.g., 13³ = 2197 cells for default domain)
-- **Neighbor search**: 27-stencil (self + 26 neighbors)
-- **Periodic wrap**: Minimum-image convention for cross-boundary pairs
-
-### XPBD Radius Adaptation
-
-Frame-rate independent radius changes using compliance-based constraints:
-
-```python
-desired_change = gain × r_old
-delta_r = desired_change / (1 + α / dt²)
-delta_r = clamp(delta_r, -rate_limit × r_old, +rate_limit × r_old)
-r_new = clamp(r_old + delta_r, r_min, r_max)
-```
-
-### PBD Overlap Resolution
-
-Adaptive multi-pass Position-Based Dynamics:
-- **Base passes**: 4 (normal case)
-- **Max passes**: 8 (scales with `max_depth`)
-- **Displacement cap**: 20% of radius per pass (anti-tunneling)
-- **Gap target**: 1.5% breathing room between particles
-
-### Brownian Motion (Optional)
-
-Ornstein-Uhlenbeck jitter for visual interest:
-- **RMS drift**: 10% of mean radius per second
-- **Time scale**: 1.0s (smooth meander)
-- **Clamp**: 20% of target gap (PBD-stable)
-
----
-
-## 📈 Performance
-
-| Configuration | FPS | Notes |
-|--------------|-----|-------|
-| N=5,000, PBC ON | ~100–120 | M1/M2 Mac, Metal backend |
-| N=5,000, Topology ON | ~20–40 | Gabriel graph is expensive |
-| N=10,000, PBC ON | ~40–60 | Grid rebuild dominates |
-
-**Bottlenecks:**
-1. **Grid rebuild**: ~40% of frame time (necessary for dynamic radii)
-2. **PBD passes**: ~30% (scales with overlap depth)
-3. **Topology**: ~20% (only when `TOPO_ENABLED=True`)
-
----
-
-## 🧩 Phase B Changelog
-
-- ✅ Added growth/relax rhythm system (discrete pulses + temporal separation)
-- ✅ Implemented runtime Taichi controls (no snap-back sliders)
-- ✅ Integrated Lévy positional diffusion → runs only during relax frames
-- ✅ Added automatic rate-limit enforcement
-- ✅ Enhanced per-pulse telemetry and console diagnostics
-- ✅ Cleaned old `LEVY_CADENCE` logic
-- ✅ Verified stability ≈ 100 FPS @ N=5000
-
----
-
-## 🔮 Future Work (Phase C Preview)
-
-- Re-enable **Gabriel graph topology** → set `LEVY_USE_TOPO_DEG=True`
-- Add **automatic relax-length adaptation** based on overlap depth
-- Extend **HUD** for live pulse metrics and FPS tracking
-- Optional: integrate Lévy diffusion strength slider
-- Explore **topology-aware growth** (use Gabriel neighbors instead of geometric)
-
----
-
-## 🧪 Acceptance Tests
-
-1. **Grid accuracy**: Neighbor counts match brute-force reference
-2. **Radius individuality**: Isolated particles grow, crowded particles shrink independently
-3. **PBD stability**: No tunneling or explosions after 1000+ frames
-4. **Periodic wrap**: Particles near boundaries detect cross-boundary neighbors
-5. **Slider persistence**: GUI values don't snap back (runtime Taichi fields)
-6. **Pulse timing**: Growth happens only at pulse frames, Lévy only during relax
-7. **Rate-limit enforcement**: `rate_limit_rt = max(RADIUS_RATE_LIMIT, grow_rate_rt)`
-
----
-
-## 🧠 Summary
-
-**Phase B** transforms the simulator from a continuously thrashing system into a **self-paced, rhythm-driven foam** where growth, motion, and topology are decoupled in time.
-
-The result is a **stable yet dynamic fabric** that visually breathes and evolves toward equilibrium — the foundation for the upcoming topological **Phase C**.
+3. **Jump Flood Algorithm** - Efficient parallel Voronoi diagram computation on GPUs
 
 ---
 
 ## 📄 License
 
-MIT
-
----
-
-## 👤 Author
-
-Built for the **Fabric of Space** project — exploring emergent foam-like behavior in variable-radius particle systems.
-
-**Repository**: [github.com/VirtualOrganics/Fabric-of-Space-Taichi](https://github.com/VirtualOrganics/Fabric-of-Space-Taichi)
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ---
 
 ## 🙏 Acknowledgments
 
-- **Taichi Graphics**: GPU-accelerated Python framework
-- **PBD/XPBD**: Müller et al., Macklin et al.
-- **Lévy diffusion**: Inspired by Voronoi centroidal relaxation
-- **Gabriel graphs**: Computational geometry for proximity analysis
+- **Taichi Team**: For the amazing GPU-accelerated compute framework
+- **Virtual Organics**: Research and development
+- Special thanks to the AI assistants who helped debug and optimize this codebase
 
 ---
 
-**Happy Simulating!** 🌌✨
+## 📞 Contact
+
+For questions, suggestions, or collaborations:
+- GitHub: [VirtualOrganics](https://github.com/VirtualOrganics)
+- Repository: [Fabric-of-Space-Taichi-JFA](https://github.com/VirtualOrganics/Fabric-of-Space-Taichi-JFA)
+
+---
+
+**Built with ❤️ using Taichi**

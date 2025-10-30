@@ -22,7 +22,12 @@ from config import (
     XSPH_EPSILON,
     PBC_ENABLED, HALF_L, INV_L,
     JITTER_ENABLED, JITTER_RMS, JITTER_TAU, MAX_DRIFT_FRACTION,
-    LEVY_ENABLED, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC, LEVY_USE_TOPO_DEG
+    LEVY_ENABLED, LEVY_ALPHA, LEVY_DEG_SPAN, LEVY_STEP_FRAC, LEVY_USE_TOPO_DEG,
+    # FSC-Only Controller
+    FSC_DEADBAND, CONTACT_TOL,
+    # Pressure Equilibration
+    PRESSURE_EQUILIBRATION_ENABLED, PRESSURE_K, PRESSURE_EXP,
+    PRESSURE_PAIR_CAP, MAX_EQ_NEI, N
 )
 from grid import pdelta, wrap_cell, cell_id, wrapP
 
@@ -163,6 +168,117 @@ def project_overlaps(pos: ti.template(), rad: ti.template(),
             ti.atomic_add(pos[i][d], correction[d])
         
         # Wrap position (PBC-aware, always-wrapped invariant)
+        pos[i] = wrapP(pos[i])
+
+
+@ti.kernel
+def project_with_pull(
+    pos: ti.template(), rad: ti.template(),
+    cell_start: ti.template(), cell_count: ti.template(),
+    cell_indices: ti.template(), n: ti.i32,
+    mean_r: ti.f32, beta_push: ti.f32, beta_pull: ti.f32,
+    deadzone_tau: ti.f32, step_cap_frac: ti.f32,
+    push_count: ti.template(), pull_count: ti.template()
+):
+    """
+    Signed-gap PBD: Push overlaps apart AND pull gaps together.
+    
+    This enables pressure propagation through the foam:
+    - Expanding particles create overlaps → push pressure
+    - Shrinking particles create gaps → pull pressure
+    - Pressure propagates through intermediate particles
+    
+    Args:
+        pos, rad: particle data
+        cell_*: spatial hashing grid
+        n: active particle count
+        mean_r: mean radius (for dead-zone and step clamping)
+        beta_push: correction strength for overlaps (typically 1.0)
+        beta_pull: correction strength for gaps (typically 0.2, weaker)
+        deadzone_tau: don't pull if gap < tau * mean_r (prevents jitter)
+        step_cap_frac: maximum step as fraction of mean_r
+        push_count, pull_count: telemetry counters (0D fields)
+    """
+    # Process all particles in parallel (atomics make counters thread-safe)
+    for i in range(n):
+        correction = ti.Vector([0.0, 0.0, 0.0])
+        
+        # My cell (PBC-aware)
+        p_wrapped = wrapP(pos[i])
+        q = (p_wrapped + HALF_L) * INV_L
+        my_cell = ti.Vector([int(q[d] * GRID_RES) for d in ti.static(range(3))])
+        
+        # Check 27 neighboring cells
+        for dx in ti.static([-1, 0, 1]):
+            for dy in ti.static([-1, 0, 1]):
+                for dz in ti.static([-1, 0, 1]):
+                    nc = my_cell + ti.Vector([dx, dy, dz])
+                    nc = wrap_cell(nc)
+                    nc_id = cell_id(nc)
+                    
+                    start = cell_start[nc_id]
+                    count = cell_count[nc_id]
+                    
+                    for k in range(start, start + count):
+                        j = cell_indices[k]
+                        
+                        if i != j:
+                            # Minimum-image vector from i to j
+                            delta = pdelta(pos[i], pos[j])
+                            dist = ti.sqrt(delta.dot(delta) + 1e-12)
+                            direction = delta / dist
+                            
+                            # Target separation (contact distance)
+                            target_sep = rad[i] + rad[j]
+                            
+                            # Signed gap: negative = overlap, positive = gap
+                            gap = dist - target_sep
+                            
+                            # Initialize correction magnitude
+                            correction_mag = 0.0
+                            
+                            # Decide action based on signed gap
+                            if gap < 0.0:
+                                # OVERLAP: push apart (standard PBD)
+                                overlap_depth = -gap
+                                correction_mag = beta_push * overlap_depth * 0.5
+                                ti.atomic_add(push_count[None], 1)
+                                
+                            elif gap > deadzone_tau * mean_r:
+                                # GAP BEYOND DEAD-ZONE: pull together
+                                gap_excess = gap - deadzone_tau * mean_r
+                                correction_mag = -beta_pull * gap_excess * 0.5  # Negative = pull
+                                ti.atomic_add(pull_count[None], 1)
+                                
+                            else:
+                                # DEAD-ZONE: do nothing
+                                correction_mag = 0.0
+                            
+                            if correction_mag != 0.0:
+                                # Apply correction
+                                # Positive mag = push away (negative direction)
+                                # Negative mag = pull together (positive direction)
+                                correction_vec = -direction * correction_mag
+                                
+                                # Cap per-pair displacement
+                                max_displacement = step_cap_frac * mean_r
+                                for d in ti.static(range(3)):
+                                    correction_vec[d] = ti.max(-max_displacement,
+                                                                ti.min(max_displacement, correction_vec[d]))
+                                
+                                correction += correction_vec
+        
+        # Cap total accumulated correction
+        max_total_displacement = step_cap_frac * mean_r * 2.0  # Allow some accumulation
+        correction_magnitude = ti.sqrt(correction.dot(correction))
+        if correction_magnitude > max_total_displacement:
+            correction = correction * (max_total_displacement / correction_magnitude)
+        
+        # Apply correction atomically
+        for d in ti.static(range(3)):
+            ti.atomic_add(pos[i][d], correction[d])
+        
+        # Wrap position (PBC)
         pos[i] = wrapP(pos[i])
 
 
@@ -773,25 +889,22 @@ def pick_palette(palette_id: ti.i32, t: ti.f32) -> ti.types.vector(3, ti.f32):
     return result
 
 @ti.kernel
-def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.template(),
+def update_colors_by_size(rad: ti.template(), color: ti.template(),
                           n: ti.i32, rad_min: ti.f32, rad_max: ti.f32,
-                          deg_low: ti.i32, deg_high: ti.i32,
                           viz_mode: ti.i32, band_min: ti.f32, band_max: ti.f32,
                           hide_out: ti.i32, palette: ti.i32, dim_alpha: ti.f32):
     """
-    Update particle colors based on visualization mode:
-      Mode 0: Degree-based (original, red/green/blue by neighbor count)
-      Mode 1: Size heatmap (colormap by radius)
+    Update particle colors based on visualization mode (FSC-Only, no degree visualization).
+      Mode 0: Size heatmap (colormap by radius) - default
+      Mode 1: Size heatmap (same as mode 0)
       Mode 2: Size band highlight (brighten in-band, dim/hide out-of-band)
     
     Args:
         rad: particle radii
-        deg: particle degrees (neighbor counts)
         color: output RGB colors
         n: number of active particles
         rad_min, rad_max: observed radius range for normalization
-        deg_low, deg_high: degree band thresholds
-        viz_mode: 0=degree, 1=heatmap, 2=band
+        viz_mode: 0/1=heatmap, 2=band
         band_min, band_max: radius band for mode 2
         hide_out: 0=dim, 1=hide out-of-band
         palette: 0=viridis, 1=turbo, 2=inferno
@@ -801,7 +914,6 @@ def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.temp
     
     for i in range(n):
         r = rad[i]
-        d = deg[i]
         
         # Normalize radius to [0, 1] for colormap
         t = (r - rad_min) / span
@@ -810,17 +922,8 @@ def update_colors_by_size(rad: ti.template(), deg: ti.template(), color: ti.temp
         # Default color (gray)
         c = ti.Vector([0.5, 0.5, 0.5])
         
-        # Mode 0: Degree-based colors (original logic)
-        if viz_mode == 0:
-            if d < deg_low:
-                c = ti.Vector([1.0, 0.2, 0.2])  # Red: low degree (growing)
-            elif d > deg_high:
-                c = ti.Vector([0.2, 0.2, 1.0])  # Blue: high degree (shrinking)
-            else:
-                c = ti.Vector([0.2, 1.0, 0.2])  # Green: in-band (stable)
-        
-        # Mode 1: Size heatmap (colormap by radius)
-        elif viz_mode == 1:
+        # Mode 0 or 1: Size heatmap (colormap by radius)
+        if viz_mode <= 1:
             c = pick_palette(palette, t)
         
         # Mode 2: Size band highlight
@@ -1062,4 +1165,437 @@ def update_radii_with_actions(
         # Clamp to hard bounds
         r_new = ti.max(rmin, ti.min(rmax, r_new))
         rad[i] = r_new
+
+@ti.kernel
+def set_radius_targets(
+    rad: ti.template(),
+    rad_target: ti.template(),
+    action: ti.template(),      # -1, 0, +1
+    n: ti.i32,
+    growth_rate: ti.f32,        # e.g., 0.04 = 4% change
+    rmin: ti.f32,
+    rmax: ti.f32
+):
+    """
+    Set target radii based on per-particle actions.
+    Target = current * (1 + action * growth_rate)
+    
+    This is called once per measurement cycle to set new targets.
+    Then nudge_radii_to_targets() is called each frame to smoothly approach targets.
+    """
+    for i in range(n):
+        a = action[i]
+        r_current = rad[i]
+        
+        if a == 0:
+            # Hold: target = current (no change)
+            rad_target[i] = r_current
+        else:
+            # Grow (+1) or shrink (-1)
+            target = r_current * (1.0 + ti.cast(a, ti.f32) * growth_rate)
+            # Clamp target to bounds
+            target = ti.max(rmin, ti.min(rmax, target))
+            rad_target[i] = target
+
+@ti.kernel
+def nudge_radii_to_targets(
+    rad: ti.template(),
+    rad_target: ti.template(),
+    n: ti.i32,
+    adjustment_frames: ti.i32  # Total frames in adjustment phase
+):
+    """
+    Smoothly nudge current radii toward targets.
+    Called every frame during adjustment phase.
+    
+    Step size = (target - current) / remaining_frames
+    This ensures we reach the target exactly by the end of the adjustment phase.
+    """
+    step_frac = 1.0 / ti.cast(adjustment_frames, ti.f32)
+    
+    for i in range(n):
+        r_now = rad[i]
+        r_tgt = rad_target[i]
+        delta = r_tgt - r_now
+        rad[i] = r_now + delta * step_frac
+
+# ==============================================================================
+# FSC-Only Controller Kernels (Phase 2)
+# ==============================================================================
+
+@ti.func
+def smoothstep(e0: ti.f32, e1: ti.f32, x: ti.f32) -> ti.f32:
+    """
+    Smoothstep function for damping band near FSC boundaries.
+    
+    Args:
+        e0: Lower edge
+        e1: Upper edge
+        x: Value to interpolate
+    
+    Returns:
+        Smoothed value in [0, 1]
+    """
+    t = ti.min(1.0, ti.max(0.0, (x - e0) / (e1 - e0)))
+    return t * t * (3.0 - 2.0 * t)
+
+@ti.kernel
+def set_fsc_targets(
+    rad: ti.template(),
+    rad_target: ti.template(),
+    fsc: ti.template(),
+    fsc_ema: ti.template(),
+    n: ti.i32,
+    f_low: ti.i32,
+    f_high: ti.i32,
+    growth_pct: ti.f32,
+    r_min: ti.f32,
+    r_max: ti.f32
+):
+    """
+    Set radius targets based on FSC band with hysteresis + EMA lag to prevent deadband lock.
+    
+    Hysteresis Strategy (prevents "frozen equilibrium"):
+    - Use EMA (smoothed FSC) for decisions, not raw FSC → adds temporal lag
+    - Hysteresis gap (±1): full action outside [f_low-1, f_high+1], reduced action inside
+    - Continuous micro-nudge when in-band → keeps dynamics alive even at equilibrium
+    
+    This ensures the foam never fully "freezes" even when everyone is nominally in-band.
+    
+    Args:
+        rad: Current radii
+        rad_target: Target radii (output)
+        fsc: Raw Face-Sharing Count from JFA (for fallback only)
+        fsc_ema: Smoothed FSC (used for decisions)
+        n: Number of particles
+        f_low: FSC lower bound (grow below this)
+        f_high: FSC upper bound (shrink above this)
+        growth_pct: Fractional size change per cycle (e.g., 0.05 = 5%)
+        r_min: Minimum radius bound
+        r_max: Maximum radius bound
+    """
+    db = ti.cast(FSC_DEADBAND, ti.f32)
+    hysteresis_gap = 1.0  # Hysteresis buffer (±1 FSC) to prevent deadband lock
+    idle_rate = 0.003     # Micro-nudge rate when in-band (0.3% of growth_pct)
+    
+    for i in range(n):
+        r0 = rad[i]
+        
+        # Use EMA for decisions (temporal lag prevents rapid oscillation)
+        # Fallback to raw FSC if EMA is zero (startup condition)
+        f_decision = fsc_ema[i] if fsc_ema[i] > 0.0 else ti.cast(fsc[i], ti.f32)
+        
+        f_low_f = ti.cast(f_low, ti.f32)
+        f_high_f = ti.cast(f_high, ti.f32)
+        
+        # Initialize gain (for Taichi scoping)
+        gain = 0.0
+        
+        if f_decision < f_low_f - hysteresis_gap:
+            # Far below band → full growth
+            gain = 1.0
+            rad_target[i] = ti.min(r0 * (1.0 + growth_pct * gain), r_max)
+        elif f_decision < f_low_f:
+            # Hysteresis zone (below band) → reduced growth with smoothstep
+            gain = 1.0 - smoothstep(f_low_f - hysteresis_gap - db, f_low_f, f_decision)
+            rad_target[i] = ti.min(r0 * (1.0 + growth_pct * gain), r_max)
+        elif f_decision > f_high_f + hysteresis_gap:
+            # Far above band → full shrink
+            gain = 1.0
+            rad_target[i] = ti.max(r0 * (1.0 - growth_pct * gain), r_min)
+        elif f_decision > f_high_f:
+            # Hysteresis zone (above band) → reduced shrink with smoothstep
+            gain = smoothstep(f_high_f, f_high_f + hysteresis_gap + db, f_decision)
+            rad_target[i] = ti.max(r0 * (1.0 - growth_pct * gain), r_min)
+        else:
+            # Within band [f_low, f_high] → apply continuous micro-nudge
+            # This prevents complete freeze at equilibrium
+            # Nudge direction: gently push toward band center
+            band_center = 0.5 * (f_low_f + f_high_f)
+            if f_decision < band_center:
+                # Below center → tiny growth
+                rad_target[i] = ti.min(r0 * (1.0 + growth_pct * idle_rate), r_max)
+            else:
+                # Above center → tiny shrink
+                rad_target[i] = ti.max(r0 * (1.0 - growth_pct * idle_rate), r_min)
+
+@ti.kernel
+def nudge_radii_adaptive_ema(
+    rad: ti.template(),
+    rad_target: ti.template(),
+    local_max_depth: ti.template(),
+    n: ti.i32,
+    alpha: ti.f32,
+    max_step_pct: ti.f32,
+    r_min: ti.f32,
+    r_max: ti.f32,
+    back_global: ti.f32,
+    mode: ti.i32
+):
+    """
+    Nudge radii toward targets using adaptive EMA with per-frame cap and backpressure.
+    
+    Implements Appendix A refinements:
+    - Adaptive EMA smoothing for gradual convergence
+    - Per-frame cap (MAX_STEP_PCT) to prevent shocks
+    - Per-particle backpressure based on local overlap depth
+    
+    Args:
+        rad: Current radii
+        rad_target: Target radii
+        local_max_depth: Per-particle maximum overlap depth
+        n: Number of particles
+        alpha: EMA factor (computed from ADJUSTMENT_FRAMES)
+        max_step_pct: Per-frame cap on |ΔR|/R
+        r_min: Minimum radius bound
+        r_max: Maximum radius bound
+        back_global: Global backpressure factor (for HUD display)
+        mode: Backpressure mode (0=off, 1=global, 2=local)
+    """
+    for i in range(n):
+        r0 = rad[i]
+        rt = ti.min(r_max, ti.max(r_min, rad_target[i]))
+        
+        # Compute EMA step
+        d = alpha * (rt - r0)
+        
+        # Apply backpressure (initialize b first for Taichi scoping)
+        b = 1.0  # Default: no backpressure
+        
+        if mode == 1:
+            # Global backpressure
+            b = back_global
+        elif mode == 2:
+            # Per-particle backpressure (Appendix A refinement)
+            b = (CONTACT_TOL - local_max_depth[i]) / CONTACT_TOL
+            b = ti.min(1.0, ti.max(0.25, b))
+        
+        d = d * b
+        
+        # Apply per-frame cap
+        cap = max_step_pct * r0
+        if d > cap:
+            d = cap
+        if d < -cap:
+            d = -cap
+        
+        # Apply and clamp
+        rad[i] = ti.min(r_max, ti.max(r_min, r0 + d))
+
+
+# ==============================================================================
+# PRESSURE EQUILIBRATION
+# ==============================================================================
+# Volume-conserving pressure diffusion across FSC neighbors.
+# Two-channel control: FSC controller (slow, topological) + pressure equilibration (fast, mechanical)
+
+@ti.func
+def hash_func(i: ti.i32, frame: ti.i32) -> ti.i32:
+    """
+    Deterministic hash for stochastic neighbor selection.
+    
+    Uses Linear Congruential Generator (LCG) for GPU determinism.
+    Returns a positive integer for use as offset in neighbor rotation.
+    
+    Args:
+        i: Particle index
+        frame: Current frame number
+    
+    Returns:
+        Hash value (positive integer)
+    """
+    return (1103515245 * (i + 12345 * frame) + 12345) & 0x7fffffff
+
+
+@ti.kernel
+def equilibrate_pressure(
+    n: ti.i32,
+    frame: ti.i32,
+    pos: ti.template(),
+    rad: ti.template(),
+    delta_r: ti.template(),
+    jfa_face_ids: ti.template(),
+    jfa_fsc: ti.template(),
+    k: ti.f32,
+    P_exp: ti.f32,
+    pair_cap: ti.f32,
+    max_nei: ti.i32,
+    r_min: ti.f32,
+    r_max: ti.f32
+) -> (ti.f32, ti.i32):
+    """
+    Volume-conserving pressure equilibration across FSC neighbors.
+    
+    Uses Jacobi iteration to avoid race conditions:
+    1. Compute volume differences across neighbor pairs
+    2. Apply capped volume exchange
+    3. Update radii from new volumes
+    
+    Args:
+        n: Number of active particles
+        frame: Current frame number (for hash)
+        pos: Particle positions (for PBC distance if needed)
+        rad: Particle radii (modified in-place)
+        delta_r: Temporary buffer for Jacobi updates
+        jfa_face_ids: JFA neighbor IDs [N, MAX_NEIGHBORS]
+        jfa_fsc: FSC count per particle [N]
+        k: Diffusion coefficient
+        P_exp: Volume exponent (3.0 for 3D)
+        pair_cap: Max ΔV as fraction of min(V_i, V_j)
+        max_nei: Max neighbors to process per particle
+        r_min: Minimum radius (for clamping)
+        r_max: Maximum radius (for clamping)
+    
+    Returns:
+        (max_abs_dr, changed_count): Maximum radius change and count of changed particles
+    """
+    
+    # Step 1: Initialize deltas to zero
+    for i in range(n):
+        delta_r[i] = 0.0
+    
+    # Step 2: Compute volume exchanges (Jacobi style)
+    for i in range(n):
+        # Get current volume (P ∝ r^P_exp)
+        Vi = rad[i] ** P_exp
+        
+        # Get FSC neighbor count
+        fsc_count = jfa_fsc[i]
+        if fsc_count <= 0:
+            continue
+        
+        # Budget neighbors via hashed rotation
+        actual_nei = ti.min(fsc_count, max_nei)
+        start_offset = hash_func(i, frame) % fsc_count
+        
+        # Process budgeted neighbors
+        for k_idx in range(actual_nei):
+            # Rotate through neighbor list
+            nei_idx = (start_offset + k_idx) % fsc_count
+            
+            # Get neighbor ID from JFA structure
+            j = jfa_face_ids[i, nei_idx]
+            
+            if j < 0 or j >= n or j == i:
+                # Skip invalid or self
+                continue
+            
+            # Get neighbor volume
+            Vj = rad[j] ** P_exp
+            
+            # Compute volume difference (pressure gradient proxy)
+            delta_V_raw = k * (Vi - Vj)
+            
+            # Cap by minimum volume (stability)
+            V_min = ti.min(Vi, Vj)
+            delta_V = ti.max(-pair_cap * V_min, ti.min(pair_cap * V_min, delta_V_raw))
+            
+            # Compute volume change for particle i only
+            # (Particle j will compute its own change when it processes i as its neighbor)
+            Vi_new = Vi - delta_V
+            
+            # Convert back to radius change for particle i
+            # New radius: r_new = V_new^(1/P_exp)
+            delta_r[i] += (Vi_new ** (1.0 / P_exp)) - rad[i]
+    
+    # Step 3: Apply deltas with hard clamps and track stats
+    max_abs_dr = ti.cast(0.0, ti.f32)
+    changed = ti.cast(0, ti.i32)
+    
+    for i in range(n):
+        d = delta_r[i]
+        if ti.abs(d) > 1e-12:
+            changed += 1
+            if ti.abs(d) > max_abs_dr:
+                max_abs_dr = ti.abs(d)
+        rad[i] = ti.max(r_min, ti.min(r_max, rad[i] + d))
+    
+    return max_abs_dr, changed
+
+
+@ti.kernel
+def compute_pressure_stats(n: ti.i32, rad: ti.template(), P_exp: ti.f32, r_min: ti.f32, r_max: ti.f32) -> (ti.f32, ti.f32, ti.f32):
+    """
+    Compute pressure statistics for telemetry.
+    
+    Reads rad[] directly to compute pressure variance and radius range.
+    
+    Args:
+        n: Number of active particles
+        rad: Particle radii
+        P_exp: Pressure exponent (for pressure metric)
+        r_min: Minimum radius threshold (for range check)
+        r_max: Maximum radius threshold (for range check)
+    
+    Returns:
+        (rmin, rmax, sigmaP): Radius min, radius max, pressure std deviation
+    """
+    rmin = 1e9
+    rmax = -1e9
+    meanP = 0.0
+    
+    # First pass: compute mean pressure and radius range
+    for i in range(n):
+        r = rad[i]
+        if r < rmin:
+            rmin = r
+        if r > rmax:
+            rmax = r
+        meanP += r ** P_exp
+    meanP /= ti.max(1, n)
+    
+    # Second pass: compute pressure variance
+    varP = 0.0
+    for i in range(n):
+        diff = (rad[i] ** P_exp) - meanP
+        varP += diff * diff
+    varP /= ti.max(1, n)
+    sigmaP = ti.sqrt(varP)
+    
+    return rmin, rmax, sigmaP
+
+
+# ==============================================================================
+# BROWNIAN MOTION (thermal jitter to keep foam active)
+# ==============================================================================
+
+@ti.kernel
+def apply_brownian_motion(
+    pos: ti.template(),
+    n: ti.i32,
+    strength: ti.f32,
+    domain_size: ti.f32
+):
+    """
+    Apply random Brownian motion to keep foam "breathing" at equilibrium.
+    
+    Adds small random displacement to each particle, creating continuous
+    micro-reorganization even when FSC and pressure are in perfect balance.
+    This prevents the "frozen equilibrium" problem.
+    
+    Args:
+        pos: Particle positions (modified in-place)
+        n: Number of particles
+        strength: Displacement magnitude (e.g., 0.0002)
+        domain_size: Size of periodic domain
+    """
+    half_L = domain_size * 0.5
+    
+    for i in range(n):
+        # Generate random displacement in each axis
+        dx = (ti.random() - 0.5) * 2.0 * strength
+        dy = (ti.random() - 0.5) * 2.0 * strength
+        dz = (ti.random() - 0.5) * 2.0 * strength
+        
+        # Apply displacement
+        pos[i][0] += dx
+        pos[i][1] += dy
+        pos[i][2] += dz
+        
+        # Wrap PBC
+        for axis in ti.static(range(3)):
+            if pos[i][axis] < -half_L:
+                pos[i][axis] += domain_size
+            elif pos[i][axis] >= half_L:
+                pos[i][axis] -= domain_size
 
