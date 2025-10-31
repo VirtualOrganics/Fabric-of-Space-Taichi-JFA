@@ -178,7 +178,7 @@ JFA_WATCHDOG_INTERVAL = 30        # Force full refresh every N JFA runs (catch d
 # ==============================================================================
 # Only re-compute JFA in regions where particles moved or radii changed
 # Expected gain: 2-6× on top of cadence + adaptive res (15-30 FPS total)
-JFA_DIRTY_TILES_ENABLED = False      # Master switch (Phase A: instrumentation only)
+JFA_DIRTY_TILES_ENABLED = True       # Master switch (Phase A: instrumentation only)
 JFA_TILE_SIZE = 16                   # Voxels per tile (sweet spot for cache locality)
 JFA_DIRTY_HALO = 1                   # Tile halo width (use 2 during warm-start)
 JFA_DIRTY_WARMSTART = True           # Disable dirty tiles during WARMSTART_FRAMES

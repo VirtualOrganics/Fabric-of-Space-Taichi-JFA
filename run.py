@@ -54,6 +54,9 @@ from config import (
     # JFA Optimization (Multi-rate + Adaptive Resolution)
     JFA_CADENCE, JFA_WARMSTART_FRAMES, JFA_WATCHDOG_INTERVAL,
     JFA_ADAPTIVE_ENABLED, JFA_VOXELS_PER_DIAMETER, JFA_RES_MIN, JFA_RES_MAX, JFA_VOXEL_SCALE,
+    # JFA Optimization (Spatial Decimation - Dirty Tiles)
+    JFA_DIRTY_TILES_ENABLED, JFA_TILE_SIZE, JFA_DIRTY_HALO, JFA_DIRTY_WARMSTART,
+    JFA_DIRTY_POS_THRESHOLD, JFA_DIRTY_RAD_THRESHOLD,
     # FSC-Only Controller (Phase 2)
     FSC_MANUAL_MODE, FSC_LOW, FSC_HIGH, GROWTH_PCT, ADJUSTMENT_FRAMES,
     MAX_STEP_PCT, MAX_STEP_PCT_RANGE,
@@ -521,6 +524,14 @@ if JFA_ADAPTIVE_ENABLED:
     print(f"  target={JFA_VOXELS_PER_DIAMETER:.1f} voxels/diameter | range=[{JFA_RES_MIN}, {JFA_RES_MAX}]³")
     print(f"  Resolution scales dynamically with mean particle radius")
 
+# Print dirty tiles configuration (Phase A: instrumentation only)
+if JFA_DIRTY_TILES_ENABLED:
+    print(f"\nDIRTY TILES (Phase A: Instrumentation Only):")
+    print(f"  tile_size={JFA_TILE_SIZE}³ voxels | halo={JFA_DIRTY_HALO} tiles")
+    print(f"  Δpos_threshold={JFA_DIRTY_POS_THRESHOLD}×voxel | Δr_threshold={JFA_DIRTY_RAD_THRESHOLD}×voxel")
+    print(f"  Warm-start: {'enabled' if JFA_DIRTY_WARMSTART else 'disabled'} (no marking during first {WARMSTART_FRAMES} frames)")
+    print(f"  ⚠️  Phase A: Marking/counting active, but NOT changing JFA behavior yet")
+
 if PRESSURE_EQUILIBRATION_ENABLED:
     print(f"\nPRESSURE EQUILIBRATION:")
     print(f"  k={PRESSURE_K:.3f} | P_exp={PRESSURE_EXP:.1f} | pair_cap={PRESSURE_PAIR_CAP:.2f}")
@@ -883,6 +894,34 @@ while window.running:
                     jfa_should_run = False
             
             if jfa_should_run:
+                # ================================================================
+                # PHASE A: DIRTY TILES (INSTRUMENTATION ONLY)
+                # ================================================================
+                # Mark tiles as dirty based on particle movement/radius changes
+                # Count dirty tiles for telemetry (Phase A: does NOT change JFA behavior yet)
+                
+                dirty_tiles_count = 0
+                total_tiles_count = 0
+                dirty_pct = 0.0
+                
+                if JFA_DIRTY_TILES_ENABLED:
+                    # Check if we should skip marking during warm-start
+                    skip_marking = JFA_DIRTY_WARMSTART and (jfa_frame_counter[None] <= JFA_WARMSTART_FRAMES)
+                    
+                    if not skip_marking:
+                        # Mark tiles based on movement/radius changes since last JFA
+                        jfa.mark_dirty_tiles(pos, rad, active_n)
+                        
+                        # Count dirty tiles for telemetry
+                        dirty_tiles_count = jfa.count_dirty_tiles()
+                        total_tiles_count = jfa.tiles_per_axis ** 3
+                        dirty_pct = 100.0 * dirty_tiles_count / max(1, total_tiles_count)
+                    else:
+                        # During warm-start: mark all tiles dirty (full JFA needed)
+                        total_tiles_count = jfa.tiles_per_axis ** 3
+                        dirty_tiles_count = total_tiles_count  # Assume 100% during warm-start
+                        dirty_pct = 100.0
+                
                 # Step 2: Adaptive resolution based on mean particle radius
                 # Compute mean radius for dynamic resolution scaling
                 r_mean_np = rad.to_numpy()[:active_n]
@@ -960,6 +999,27 @@ while window.running:
                         print(f"      ✓ Validation passed (still converging)")
                     else:
                         print(f"      ⚠️  Validation FAILED")
+                    
+                    # ============================================================
+                    # PHASE A: DIRTY TILES TELEMETRY (Instrumentation Only)
+                    # ============================================================
+                    # Print dirty tile statistics for validation
+                    # Phase A: Marking/counting active, but NOT changing JFA behavior
+                    if JFA_DIRTY_TILES_ENABLED:
+                        # Compute voxel size for threshold display
+                        voxel_size = DOMAIN_SIZE / jfa_res_dynamic
+                        
+                        print(f"[JFA][PhaseA] tiles={dirty_tiles_count}/{total_tiles_count} ({dirty_pct:.1f}%) | "
+                              f"halo={JFA_DIRTY_HALO} | "
+                              f"Δpos_thr={JFA_DIRTY_POS_THRESHOLD}×{voxel_size:.6f} | "
+                              f"Δr_thr={JFA_DIRTY_RAD_THRESHOLD}×{voxel_size:.6f}")
+                
+                # ============================================================
+                # PHASE A: UPDATE TILE CACHE (for next frame's dirty marking)
+                # ============================================================
+                # Cache current particle state for next frame's comparison
+                if JFA_DIRTY_TILES_ENABLED:
+                    jfa.update_tile_cache(pos, rad, active_n)
             
             # ================================================================
             # WARM-START GATE (prevents FSC=0 runaway during startup)
