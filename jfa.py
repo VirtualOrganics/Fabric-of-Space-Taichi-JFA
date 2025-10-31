@@ -39,7 +39,11 @@ from config import (
     JFA_DIRTY_POS_THRESHOLD,
     JFA_DIRTY_RAD_THRESHOLD,
     JFA_DIRTY_HALO,
-    JFA_TILE_SIZE
+    JFA_TILE_SIZE,
+    # Phase B.2: Early Exit constants
+    JFA_EARLY_EXIT_ENABLED,
+    TH_PASS_DELTA,
+    MIN_JFA_PASSES
 )
 
 # ============================================================================
@@ -1079,6 +1083,7 @@ def run_jfa(pos, rad, active_n):
     ping = 0
     actual_passes = 0
     early_exit_triggered = False
+    delta_history = []  # Track change fraction per pass (for telemetry)
     
     for pass_idx in range(JFA_NUM_PASSES):
         if step_size < 1:
@@ -1094,13 +1099,15 @@ def run_jfa(pos, rad, active_n):
         step_size = step_size // 2
         actual_passes += 1
         
-        # Step 5: Early-exit if convergence detected (after first 2 passes)
-        if pass_idx >= 2:
-            changes = label_changes[None]
-            total_voxels = JFA_RES * JFA_RES * JFA_RES
-            change_fraction = changes / max(1, total_voxels)
-            
-            if change_fraction < 0.001:  # Less than 0.1% of voxels changed
+        # Track convergence (changed voxels this pass)
+        changes = label_changes[None]
+        total_voxels = JFA_RES * JFA_RES * JFA_RES
+        change_fraction = changes / max(1, total_voxels)
+        delta_history.append(change_fraction)
+        
+        # Phase B.2: Early-exit if convergence detected (after MIN_JFA_PASSES)
+        if JFA_EARLY_EXIT_ENABLED and pass_idx >= (MIN_JFA_PASSES - 1):
+            if change_fraction < TH_PASS_DELTA:
                 early_exit_triggered = True
                 break
     
@@ -1170,6 +1177,7 @@ def run_jfa(pos, rad, active_n):
     stats = {
         "num_passes": actual_passes,
         "early_exit": early_exit_triggered,
+        "delta_history": delta_history,  # Phase B.2: per-pass convergence deltas
         "jfa_res": JFA_RES,
         "voxel_size": VOXEL_SIZE,
         "mean_score": mean_score,

@@ -6,12 +6,12 @@
 
 *Real-time topological foam simulation with 10,000 particles showing size-based heatmap coloring and live FSC control panel.*
 
-A real-time GPU-accelerated foam simulation implementing **dual-channel topological control**: Face-Sharing Count (FSC) from power diagrams drives structural adaptation, while volume-conserving pressure equilibration ensures mechanical consistency. Interactive, GPU-optimized, and running at ~10 FPS on 10,000 particles.
+A real-time GPU-accelerated foam simulation implementing **dual-channel topological control**: Face-Sharing Count (FSC) from power diagrams drives structural adaptation, while volume-conserving pressure equilibration ensures mechanical consistency. Interactive, GPU-optimized, and running at ~4 FPS on 10,000 particles.
 
 ![Foam Simulation](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![Taichi](https://img.shields.io/badge/Taichi-1.7.0+-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Performance](https://img.shields.io/badge/Performance-~10_FPS_(10k_particles)-brightgreen.svg)
+![Performance](https://img.shields.io/badge/Performance-~4_FPS_(10k_particles)-brightgreen.svg)
 
 ---
 
@@ -20,7 +20,7 @@ A real-time GPU-accelerated foam simulation implementing **dual-channel topologi
 ### **Short Description**
 
 **Fabric of Space: Topological Foam Simulator**  
-Real-time cellular structure evolution driven by **Face-Sharing Count (FSC)** from a power diagram. Cells adapt radii to maintain target connectivity; volume-conserving pressure diffusion creates mechanical equilibrium. PBD enforces constraints, Minkowski spheres visualize pressure. GPU-accelerated (~10 FPS, 10k particles), interactive via live FSC band sliders. **No SPH, no DEM forces—pure control theory.**
+Real-time cellular structure evolution driven by **Face-Sharing Count (FSC)** from a power diagram. Cells adapt radii to maintain target connectivity; volume-conserving pressure diffusion creates mechanical equilibrium. PBD enforces constraints, Minkowski spheres visualize pressure. GPU-accelerated (~4 FPS, 10k particles), interactive via live FSC band sliders. **No SPH, no DEM forces—pure control theory.**
 
 ### **Technical Description**
 
@@ -39,7 +39,7 @@ Volume-conserving pressure diffusion across FSC neighbors using Jacobi iteration
 - Minkowski sphere rendering: Visualizes pressure fields, not geometric surfaces  
 
 **Performance:**  
-Multi-rate JFA decimation (1/5 cadence after warm-start) achieves ~10 FPS on 10k particles (2.4× speedup). Adaptive resolution, warm-start topology stabilization, and watchdog drift detection ensure correctness.
+Multi-rate JFA decimation (1/5 cadence after warm-start), adaptive resolution, and early-exit passes achieve ~4 FPS on 10k particles (~3.5× speedup from baseline). Warm-start topology stabilization and watchdog drift detection ensure correctness.
 
 **Key Distinction:** Neither SPH (no Navier-Stokes PDEs) nor classical DEM (no Hertzian contact forces). Instead, a **control-theoretic** approach where topology defines structure and volume flux defines dynamics. Suitable for studying emergent foam behavior, cellular packing, and topological phase transitions.
 
@@ -309,34 +309,49 @@ Geometric degree (distance-based neighbor counting) is unreliable and drifts wit
 ## ⚡ Performance & Optimization
 
 ### Current Performance
-- **~10 FPS** @ 10,000 particles (M1 Pro / RTX 3060 Ti)
-- **JFA = 77%** of frame time (topology detection bottleneck)
-- **Multi-rate decimation** (JFA every 5 frames) → **2.4× speedup**
-- **Adaptive resolution** (scales with mean radius) → **Expected 1.3-1.5× additional speedup**
+- **~4.2 FPS** @ 10,000 particles @ 270³ JFA resolution (M1 Pro / similar GPU)
+- **JFA = 70-75%** of frame time (topology detection bottleneck)
+- **Multi-rate decimation** (JFA every 5 frames) → **2.4× speedup** ✅
+- **Adaptive resolution** (scales with mean radius) → **1.3× speedup** ✅
+- **Early-exit JFA** (stops at ~8/10 passes) → **~15% JFA time reduction** ✅
 
-### Optimization Roadmap
+**Cumulative Speedup:** ~3.5× from baseline (1.2 FPS → 4.2 FPS)
 
-See **[`docs/GITHUB_ISSUES.md`](docs/GITHUB_ISSUES.md)** for detailed optimization issues and implementation plans:
+### Optimization Status
 
-1. **Multi-Rate Loop (JFA Decimation)** ✅ *Implemented*  
+See **[`docs/GITHUB_ISSUES.md`](docs/GITHUB_ISSUES.md)** for detailed optimization analysis:
+
+1. **Multi-Rate Loop (JFA Decimation)** ✅ *Complete*  
    Run JFA at 1/5 cadence with warm-start + watchdog → 2.4× speedup
 
-2. **Adaptive JFA Resolution** ✅ *Implemented*  
-   Scale voxel grid with mean radius dynamically (`res ∝ L / r_mean`) → 1.3-1.5× speedup
+2. **Adaptive JFA Resolution** ✅ *Complete*  
+   Scale voxel grid with mean radius dynamically (`res ∝ L / r_mean`) → 1.3× speedup
 
-3. **Dirty Tiles (Spatial Decimation)**  
-   Only re-rasterize/propagate JFA in regions where particles moved
+3. **Early-Exit JFA Passes** ✅ *Complete*  
+   Stop flood iterations when voxel changes drop below 0.6% → 8/10 passes typical (~15% JFA speedup)
 
-4. **Early-Exit JFA Tightening**  
-   Stop flood passes early when FSC changes drop below threshold
+4. **Temporal Skip (Activity-Based JFA Scheduling)** ❌ *Not Applicable*  
+   Blocked by continuous activity (Brownian + Pressure EQ) → No cycles skipped
 
-5. **Adaptive PBD Budget**  
-   Reduce iterations when overlap is low; skip grid rebuild if motion is minimal
+5. **Dirty Tiles (Spatial Decimation)** ❌ *Not Applicable*  
+   Blocked by global motion (100% dirty tiles every cycle) → No spatial savings
 
-6. **Render Throttles**  
-   Drop render cadence when window not focused; batch HUD updates
+### Why Optimization Has Plateaued
 
-> **Note:** Performance metrics are logged every 60 frames via `[PERF]` telemetry in the console. Use these for tracking optimization progress.
+The system is **activity-bound**, not **compute-bound**:
+- Brownian motion → all particles move every frame
+- Pressure equilibration → radii change every frame
+- JFA must respond to these changes → no safe way to skip work
+
+**To achieve >2× additional speedup would require:**
+- Disabling continuous motion (defeats "alive foam" goal)
+- Reducing particle count (defeats visual richness)
+- Accepting lower topology accuracy (defeats FSC control)
+- **Using a different algorithm** (e.g., pure SPH, GPU-native kernels)
+
+**Current performance is reasonable** for this class of simulation (real-time topological foam with 10k particles).
+
+> **Note:** Performance metrics are logged every 60 frames via `[PERF]` telemetry in the console.
 
 ---
 

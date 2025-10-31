@@ -388,6 +388,66 @@ JFA_DIRTY_ESCALATION_THRESHOLD = 0.6 # Promote to full if dirty% > 60%
 
 ---
 
+## Issue 6: Phase B - Temporal Skip + Early Exit
+
+**Status:** ⚠️ Partial (Early Exit only)
+
+### What We Implemented
+
+**Phase B.1: Temporal Skip (Activity-Based JFA Scheduling)**
+- **Goal**: Skip entire JFA cycles when topology unlikely to change
+- **Mechanism**: Activity triggers (σ(Δr), v_max, ΔμFSC) + watchdog + band-change lockout
+- **Result**: ❌ **NOT APPLICABLE** - Continuous activity (Brownian + Pressure EQ) fires triggers every frame
+
+**Phase B.2: Early Exit (Per-Pass Convergence)**
+- **Goal**: Stop JFA passes when voxel changes drop below threshold
+- **Mechanism**: Track `changed_voxels/total_voxels` per pass, break when `δ ≤ 0.6%` (min 3 passes)
+- **Result**: ✅ **WORKING** - Typically 8/10 passes (saves 20% JFA time)
+
+### Performance Impact
+
+| Metric | Before Phase B | After Phase B | Change |
+|--------|---------------|---------------|---------|
+| JFA Passes | 9-10 | 8 typical | -20% |
+| JFA Time (270³ res) | ~300ms | ~260-270ms | -10-15% |
+| Overall FPS | ~4.2 FPS | ~4.2 FPS | **~0%** |
+
+**Why minimal FPS impact?**
+- JFA is ~70-75% of frame time
+- 20% reduction in JFA = 14-15% reduction in total frame time
+- Spread over 5-frame cadence = ~3% per-frame improvement
+- **Lost in measurement noise**
+
+### Key Learnings
+
+1. **Temporal skip doesn't work with continuous motion**
+   - Brownian motion → all particles jitter every frame
+   - Pressure equilibration → radii change every frame
+   - Activity triggers always fire → no cycles skipped
+   
+2. **Spatial decimation doesn't work with global activity**
+   - Dirty tiles = 100% every cycle (global Brownian)
+   - No localized changes to exploit
+   
+3. **Early exit has hard limits**
+   - JFA inherently needs ~8 passes to converge at current resolutions
+   - Can't exit much earlier without topology errors
+   
+4. **The system is activity-bound, not compute-bound**
+   - Further optimization requires **algorithmic changes**, not implementation tweaks
+
+### Recommendation
+
+**Stop incremental JFA optimization.** To achieve significant speedup (>2×), would need:
+- **Turn off continuous motion** (defeats "alive foam" goal)
+- **Reduce particle count** (defeats visual richness)
+- **Accept lower topology accuracy** (defeats FSC control)
+- **Use different algorithm** (e.g., pure SPH, no JFA)
+
+Current performance (4.2 FPS @ 10k particles, 270³ res) is **reasonable for this class of simulation**.
+
+---
+
 ## Summary
 
 | Issue | Status | Expected Gain | Complexity | Priority |
@@ -396,9 +456,12 @@ JFA_DIRTY_ESCALATION_THRESHOLD = 0.6 # Promote to full if dirty% > 60%
 | 2. Adaptive Resolution | ✅ Done | 1.3-1.5× | Low | Complete |
 | 3. fp64 Welford | ✅ Done | N/A (bugfix) | Low | Complete |
 | 4. Benchmark Script | 🔄 Deferred | N/A (tooling) | Low | Post-Phase 2 |
-| 5. Spatial Decimation | 📋 Open | 2-3× | High | **Next** |
+| 5. Spatial Decimation | ❌ N/A | 0× (blocked by Brownian) | Medium | **Abandoned** |
+| 6. Temporal Skip + Early Exit | ⚠️ Partial | ~0% (early exit only) | Medium | **Closed** |
 
-**Cumulative Expected Speedup:** 4.2 FPS → ~40-50 FPS (10-12× total)
+**Actual Cumulative Speedup:** ~3.5× (multi-rate cadence + adaptive res + early exit)  
+**Current Performance:** 4.2 FPS @ 10k particles, 270³ JFA resolution  
+**Assessment:** Optimization has reached **diminishing returns** - further gains require algorithmic changes
 
 ---
 

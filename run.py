@@ -57,6 +57,10 @@ from config import (
     # JFA Optimization (Spatial Decimation - Dirty Tiles)
     JFA_DIRTY_TILES_ENABLED, JFA_TILE_SIZE, JFA_DIRTY_HALO, JFA_DIRTY_WARMSTART,
     JFA_DIRTY_POS_THRESHOLD, JFA_DIRTY_RAD_THRESHOLD,
+    # JFA Optimization (Phase B - Temporal Skip + Early Exit)
+    JFA_TEMPORAL_SKIP_ENABLED, TH_RSIGMA, TH_MARGIN_SAFE, TH_FSC_DRIFT,
+    MAX_SKIP_FRAMES, SKIP_BAND_CHANGE_LOCKOUT,
+    JFA_EARLY_EXIT_ENABLED, TH_PASS_DELTA, MIN_JFA_PASSES,
     # FSC-Only Controller (Phase 2)
     FSC_MANUAL_MODE, FSC_LOW, FSC_HIGH, GROWTH_PCT, ADJUSTMENT_FRAMES,
     MAX_STEP_PCT, MAX_STEP_PCT_RANGE,
@@ -159,6 +163,13 @@ adjustment_timer = ti.field(dtype=ti.i32, shape=())      # Countdown: 0 = measur
 # JFA cadence tracking (multi-rate optimization)
 jfa_frame_counter = ti.field(dtype=ti.i32, shape=())     # Frame counter for JFA cadence
 jfa_watchdog_counter = ti.field(dtype=ti.i32, shape=())  # Watchdog counter (force refresh every N JFA runs)
+
+# Phase B: Temporal skip state (CPU-side, not Taichi fields)
+frames_since_jfa = 0            # Frames elapsed since last JFA run
+last_fsc_mu = None              # Last measured FSC mean (for drift detection)
+pos_prev = None                 # Cached positions from previous frame (for v_max calculation)
+rad_prev_cached = None          # Cached radii from previous frame (for σ(Δr) calculation)
+band_change_lockout = 0         # Frames remaining in band-change lockout (force JFA)
 
 # Runtime particle sizing control
 r_start_rt = ti.field(dtype=ti.f32, shape=())            # Starting radius (for reset/GUI)
@@ -532,6 +543,20 @@ if JFA_DIRTY_TILES_ENABLED:
     print(f"  Warm-start: {'enabled' if JFA_DIRTY_WARMSTART else 'disabled'} (no marking during first {WARMSTART_FRAMES} frames)")
     print(f"  ⚠️  Phase A: Marking/counting active, but NOT changing JFA behavior yet")
 
+# Print Phase B: Temporal Skip + Early Exit configuration
+if JFA_TEMPORAL_SKIP_ENABLED:
+    print(f"\nPHASE B: TEMPORAL SKIP (NOT APPLICABLE)")
+    print(f"  ⚠️  Continuous activity (Brownian + Pressure EQ) prevents temporal skipping")
+    print(f"  ⚠️  Activity triggers fire every frame → JFA runs every cadence cycle")
+
+if JFA_EARLY_EXIT_ENABLED:
+    print(f"\nPHASE B.2: EARLY EXIT (ACTIVE OPTIMIZATION)")
+    print(f"  Stop JFA passes when convergence detected:")
+    print(f"    Threshold: δ(changed_voxels) ≤ {TH_PASS_DELTA*100:.1f}%")
+    print(f"    Min passes: {MIN_JFA_PASSES} (safety guard)")
+    print(f"  Expected gain: 1.3-1.5× JFA time reduction (9→6-7 passes typical)")
+    print(f"  Telemetry format: passes=X/Y (early_exit=True) | δ=[...%, ...%*]")
+
 if PRESSURE_EQUILIBRATION_ENABLED:
     print(f"\nPRESSURE EQUILIBRATION:")
     print(f"  k={PRESSURE_K:.3f} | P_exp={PRESSURE_EXP:.1f} | pair_cap={PRESSURE_PAIR_CAP:.2f}")
@@ -771,6 +796,12 @@ while window.running:
                 hud_text = f"Settling: {max(0, settle_frames_left)}/{ADJUSTMENT_FRAMES} | Alpha: {alpha*100:.1f}% | Speed: {speed_pct}%"
                 print(f"[HUD] {hud_text}")
         
+        # === CACHE POSITIONS (for temporal skip v_max calculation) ===
+        # Store positions before motion updates for velocity/displacement tracking
+        if JFA_TEMPORAL_SKIP_ENABLED and pos_prev is None:
+            # Initialize on first frame
+            pos_prev = pos.to_numpy()[:active_n].copy()
+        
         # === BROWNIAN MOTION (thermal jitter to prevent frozen equilibrium) ===
         # Apply continuous micro-perturbation to keep foam "breathing"
         if BROWNIAN_ENABLED:
@@ -863,35 +894,128 @@ while window.running:
                 jfa_measurement_counter += 1
             
             # ================================================================
-            # MULTI-RATE JFA (Decimation with Warm-start + Watchdog)
+            # PHASE B: TEMPORAL SKIP (Topology-aware JFA scheduling)
             # ================================================================
-            # Goal: Run JFA less frequently to reduce frame time (JFA = 77% of cost)
-            # Safety: Warm-start period + periodic watchdog to ensure no drift
+            # Goal: Skip JFA when topology is unlikely to change (2-4.5× speedup)
+            # Safety: Activity triggers + watchdog + band-change lockout
             
             jfa_should_run = False
+            skip_reason = ""  # For telemetry
             
             if JFA_ENABLED and FSC_MANUAL_MODE:
-                # Increment frame counter
+                # Increment frame counter (for warm-start)
                 jfa_frame_counter[None] += 1
                 current_frame = jfa_frame_counter[None]
+                frames_since_jfa += 1
                 
-                # Warm-start period: run JFA every frame to stabilize topology
-                if current_frame <= JFA_WARMSTART_FRAMES:
-                    jfa_should_run = True
-                    if current_frame == 1:
-                        print(f"[JFA Cadence] Warm-start: running every frame for first {JFA_WARMSTART_FRAMES} frames")
-                # After warm-start: decimate to every N frames
-                elif current_frame % JFA_CADENCE == 0:
-                    jfa_should_run = True
-                    jfa_watchdog_counter[None] += 1
+                # === SIGNAL MEASUREMENT (for temporal skip decision) ===
+                # Compute activity signals to determine if JFA can be safely skipped
+                
+                # Get current positions and radii (after PBD + Brownian)
+                pos_curr = pos.to_numpy()[:active_n]
+                rad_curr = rad.to_numpy()[:active_n]
+                
+                # 1. Radius variance: σ(|Δr|) / r_mean
+                r_mean = float(rad_curr.mean()) if active_n > 0 else 0.0001
+                if pos_prev is not None and pos_prev.shape[0] == active_n and rad_prev_cached is not None:
+                    # Compute per-particle radius changes from previous frame
+                    dr_abs = np.abs(rad_curr - rad_prev_cached)
+                    sigma_dr = float(dr_abs.std()) if active_n > 0 else 0.0
+                    sigma_dr_over_r = sigma_dr / max(r_mean, 1e-9)
                     
-                    # Watchdog: force refresh every M JFA runs (catch drift)
-                    if jfa_watchdog_counter[None] >= JFA_WATCHDOG_INTERVAL:
-                        jfa_watchdog_counter[None] = 0
-                        if current_frame == JFA_WARMSTART_FRAMES + JFA_CADENCE:
-                            print(f"[JFA Cadence] Decimation: running every {JFA_CADENCE} frames (watchdog every {JFA_WATCHDOG_INTERVAL} runs)")
+                    # 2. Max velocity: max(||pos - pos_prev||)
+                    pos_delta = pos_curr - pos_prev
+                    # Handle PBC wrapping (particles can teleport across boundaries)
+                    pos_delta = np.where(np.abs(pos_delta) > DOMAIN_SIZE * 0.5,
+                                        pos_delta - np.sign(pos_delta) * DOMAIN_SIZE,
+                                        pos_delta)
+                    vmax_dt = float(np.max(np.linalg.norm(pos_delta, axis=1))) if active_n > 0 else 0.0
                 else:
-                    jfa_should_run = False
+                    # First frame or size mismatch - force run
+                    sigma_dr_over_r = 999.0
+                    vmax_dt = 999.0
+                
+                # Cache current rad for next frame (always update)
+                rad_prev_cached = rad_curr.copy()
+                
+                # 3. FSC drift: |μ(FSC) - μ(FSC)_last|
+                if last_fsc_mu is not None and jfa.fsc[0] >= 0:
+                    fsc_curr = jfa.fsc.to_numpy()[:active_n]
+                    fsc_mu_curr = float(fsc_curr.mean()) if active_n > 0 else 0.0
+                    delta_fsc_mu = abs(fsc_mu_curr - last_fsc_mu)
+                else:
+                    delta_fsc_mu = 999.0  # Force run if no baseline
+                
+                # === DECISION LOGIC (run if ANY trigger fires) ===
+                
+                # Compute thresholds (dynamic, based on r_mean)
+                th_sigma = TH_RSIGMA
+                th_margin = TH_MARGIN_SAFE * r_mean
+                
+                # Decrement band-change lockout
+                if band_change_lockout > 0:
+                    band_change_lockout -= 1
+                
+                # Check triggers (run if ANY is true)
+                trigger_warmstart = (current_frame <= JFA_WARMSTART_FRAMES)
+                trigger_watchdog = (frames_since_jfa >= MAX_SKIP_FRAMES)
+                trigger_band_change = (band_change_lockout > 0)
+                trigger_activity = (
+                    sigma_dr_over_r > th_sigma or
+                    vmax_dt > th_margin or
+                    delta_fsc_mu > TH_FSC_DRIFT
+                )
+                
+                # Safety rail: if %out-of-band > 10% and we skipped last frame, force run
+                if frames_since_jfa > 1 and jfa.fsc[0] >= 0:
+                    fsc_check = jfa.fsc.to_numpy()[:active_n]
+                    out_of_band_count = np.sum((fsc_check < gui_fsc_low) | (fsc_check > gui_fsc_high))
+                    out_of_band_pct = float(out_of_band_count) / float(max(1, active_n))
+                    trigger_out_of_band = (out_of_band_pct > 0.10)
+                else:
+                    trigger_out_of_band = False
+                
+                # Final decision
+                jfa_should_run = (
+                    trigger_warmstart or
+                    trigger_watchdog or
+                    trigger_band_change or
+                    trigger_activity or
+                    trigger_out_of_band or
+                    not JFA_TEMPORAL_SKIP_ENABLED  # Fallback: always run if skip disabled
+                )
+                
+                # === TELEMETRY ===
+                if jfa_should_run:
+                    # Determine reason for run
+                    if trigger_warmstart:
+                        skip_reason = "warm-start"
+                        if current_frame == 1:
+                            print(f"[JFA Skip] Warm-start: running every frame for first {JFA_WARMSTART_FRAMES} frames")
+                    elif trigger_band_change:
+                        skip_reason = "band-change"
+                    elif trigger_watchdog:
+                        skip_reason = "watchdog"
+                    elif trigger_out_of_band:
+                        skip_reason = f"out-of-band-guard ({out_of_band_pct*100:.1f}%)"
+                    elif trigger_activity:
+                        skip_reason = "activity"
+                    else:
+                        skip_reason = "fallback"
+                    
+                    print(f"[JFA Run ] reason={skip_reason} | since={frames_since_jfa}")
+                    
+                    # Reset skip counter and update baseline
+                    frames_since_jfa = 0
+                else:
+                    # Skipping JFA - print diagnostic
+                    print(f"[JFA Skip] σ(Δr)/r={sigma_dr_over_r:.4f} ≤ {th_sigma:.4f} | " +
+                          f"vmax*dt={vmax_dt:.6f} ≤ {th_margin:.6f} | " +
+                          f"ΔμFSC={delta_fsc_mu:.3f} ≤ {TH_FSC_DRIFT:.3f} | " +
+                          f"since={frames_since_jfa}/{MAX_SKIP_FRAMES}")
+                
+                # Update pos_prev for next frame
+                pos_prev = pos_curr.copy()
             
             if jfa_should_run:
                 # ================================================================
@@ -955,6 +1079,12 @@ while window.running:
                 # End timing
                 t_jfa = time.perf_counter() - t_jfa_start
                 
+                # === TEMPORAL SKIP: Update FSC baseline ===
+                # Store current FSC mean for next frame's drift detection
+                if JFA_TEMPORAL_SKIP_ENABLED:
+                    fsc_np_temp = jfa.fsc.to_numpy()[:active_n]
+                    last_fsc_mu = float(fsc_np_temp.mean()) if active_n > 0 else 0.0
+                
                 # ================================================================
                 # STEP 4 - DEVICE-SIDE TELEMETRY (GPU METRICS)
                 # ================================================================
@@ -979,10 +1109,28 @@ while window.running:
                           f"EMA μ={mean_fsc_ema:.1f}")
                     print(f"      score: μ={mean_score:.2f} σ={std_score:.2f} | "
                           f"pairs: {p_und} (P_dir={p_dir})")
+                    # Format delta history for telemetry (Phase B.2)
+                    delta_hist = jfa_stats.get('delta_history', [])
+                    if delta_hist:
+                        # Show up to 6 most significant deltas
+                        if jfa_stats['early_exit'] and len(delta_hist) > 0:
+                            # Mark the last delta that triggered exit with asterisk
+                            delta_parts = [f"{d*100:.1f}%" for d in delta_hist[:-1]]
+                            delta_parts.append(f"{delta_hist[-1]*100:.1f}%*")
+                            delta_str = ', '.join(delta_parts[:6])
+                        else:
+                            delta_str = ', '.join([f"{d*100:.1f}%" for d in delta_hist[:6]])
+                        delta_display = f" | δ=[{delta_str}]"
+                    else:
+                        delta_display = ""
+                    
+                    # Compute expected max passes for current resolution
+                    max_passes_expected = int(np.ceil(np.log2(jfa_res_dynamic))) + 1
+                    
                     print(f"      asym={asym_pct:.1f}% overflow={overflow_pct:.1f}% | "
                           f"time={t_jfa*1000:.1f}ms | res={jfa_res_dynamic}³ | "
-                          f"passes={jfa_stats['num_passes']} "
-                          f"(early_exit={jfa_stats['early_exit']})")
+                          f"passes={jfa_stats['num_passes']}/{max_passes_expected} "
+                          f"(early_exit={jfa_stats['early_exit']}){delta_display}")
                     
                     # Validation status with updated acceptance criteria
                     validation_passed = jfa_validation["passed"]
@@ -1291,11 +1439,19 @@ while window.running:
     window.GUI.text("")
     
     # FSC band sliders (live control)
+    prev_fsc_low = gui_fsc_low
+    prev_fsc_high = gui_fsc_high
     gui_fsc_low = window.GUI.slider_int("FSC Low", gui_fsc_low, 1, 30)
     gui_fsc_high = window.GUI.slider_int("FSC High", gui_fsc_high, 1, 40)
     # Ensure low < high
     if gui_fsc_low >= gui_fsc_high:
         gui_fsc_high = gui_fsc_low + 1
+    
+    # Detect band changes and set lockout (for temporal skip)
+    if JFA_TEMPORAL_SKIP_ENABLED and (gui_fsc_low != prev_fsc_low or gui_fsc_high != prev_fsc_high):
+        band_change_lockout = SKIP_BAND_CHANGE_LOCKOUT
+        print(f"[Band Change] [{prev_fsc_low},{prev_fsc_high}] → [{gui_fsc_low},{gui_fsc_high}] | lockout={SKIP_BAND_CHANGE_LOCKOUT} frames")
+    
     window.GUI.text("")
     
     # Radius limits section

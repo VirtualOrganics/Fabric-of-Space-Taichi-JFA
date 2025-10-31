@@ -190,6 +190,25 @@ JFA_DIRTY_POS_THRESHOLD = 0.5        # Mark dirty if |Δpos| > 0.5 * voxel_size
 JFA_DIRTY_RAD_THRESHOLD = 0.25       # Mark dirty if |Δr| > 0.25 * voxel_size
 JFA_DIRTY_BOUNDARY_HYSTERESIS = 0.1  # Buffer before re-marking tile edge oscillations
 
+# ==============================================================================
+# JFA OPTIMIZATION: Phase B - Temporal Skip + Early Exit
+# ==============================================================================
+# Skip whole JFA cycles when topology is unlikely to change
+# Expected gain: 1.8-3× (skip) × 1.3-1.5× (early-exit) = 2.3-4.5× total
+
+# Temporal skip thresholds (all must be satisfied to skip JFA)
+JFA_TEMPORAL_SKIP_ENABLED = True     # Master switch for temporal skipping
+TH_RSIGMA = 0.004                    # σ(|Δr|)/r_mean threshold (0.4% of mean radius)
+TH_MARGIN_SAFE = 0.4                 # v_max * dt threshold (as fraction of r_mean)
+TH_FSC_DRIFT = 0.05                  # |Δμ(FSC)| threshold (faces)
+MAX_SKIP_FRAMES = 15                 # Maximum consecutive JFA skips (watchdog)
+SKIP_BAND_CHANGE_LOCKOUT = 2         # Force JFA for N frames after band change
+
+# Early-exit inside JFA passes (stop when voxel changes drop below threshold)
+JFA_EARLY_EXIT_ENABLED = True        # Master switch for early-exit
+TH_PASS_DELTA = 0.006                # Stop when changed_voxels/total < 0.6%
+MIN_JFA_PASSES = 3                   # Always run at least N passes (prevent premature exit)
+
 # Precomputed constants (Python scope, compile-time folded by Taichi)
 HALF_L = 0.5 * DOMAIN_SIZE  # Half domain size for centered coordinates
 INV_L = 1.0 / DOMAIN_SIZE   # Inverse domain size (avoid repeated division)
