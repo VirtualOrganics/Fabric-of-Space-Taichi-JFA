@@ -1015,6 +1015,14 @@ while window.running:
                               f"Δr_thr={JFA_DIRTY_RAD_THRESHOLD}×{voxel_size:.6f}")
                 
                 # ============================================================
+                # PHASE A: CLEAR DIRTY FLAGS (reset for next frame)
+                # ============================================================
+                # Clear all dirty flags after JFA completes and telemetry is printed
+                # This ensures next frame starts fresh and only marks tiles that changed
+                if JFA_DIRTY_TILES_ENABLED:
+                    jfa.clear_dirty_tiles()
+                
+                # ============================================================
                 # PHASE A: UPDATE TILE CACHE (for next frame's dirty marking)
                 # ============================================================
                 # Cache current particle state for next frame's comparison
