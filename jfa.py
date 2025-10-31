@@ -33,7 +33,13 @@ from config import (
     MIN_FACE_VOXELS,
     JFA_RES_MIN,
     JFA_RES_MAX,
-    JFA_VOXEL_SCALE
+    JFA_VOXEL_SCALE,
+    JFA_EMA_ALPHA,
+    # Dirty Tiles (Phase A) constants
+    JFA_DIRTY_POS_THRESHOLD,
+    JFA_DIRTY_RAD_THRESHOLD,
+    JFA_DIRTY_HALO,
+    JFA_TILE_SIZE
 )
 
 # ============================================================================
@@ -180,7 +186,6 @@ def init_jfa():
     # Initial allocation uses JFA_RES_MAX to allow for dynamic resolution changes
     
     # Compute max tiles needed (for allocation at JFA_RES_MAX)
-    from config import JFA_TILE_SIZE
     max_tiles = (JFA_RES_MAX + JFA_TILE_SIZE - 1) // JFA_TILE_SIZE
     
     # Dirty flag per tile (1 = dirty, needs JFA; 0 = clean, can skip)
@@ -215,7 +220,6 @@ def set_resolution(new_res: int):
     JFA_NUM_PASSES = int(np.ceil(np.log2(JFA_RES))) + 1  # One extra for safety
     
     # Recompute tile dimensions for spatial decimation
-    from config import JFA_TILE_SIZE
     tiles_per_axis = (JFA_RES + JFA_TILE_SIZE - 1) // JFA_TILE_SIZE
 
 
@@ -319,7 +323,6 @@ def world_to_tile(world_pos: ti.math.vec3) -> ti.math.ivec3:
     voxel_idx = world_to_voxel(world_pos)
     
     # Then convert to tile index (integer division)
-    from config import JFA_TILE_SIZE
     return ti.math.ivec3([
         voxel_idx[0] // JFA_TILE_SIZE,
         voxel_idx[1] // JFA_TILE_SIZE,
@@ -973,11 +976,6 @@ def mark_dirty_tiles(pos: ti.template(), rad: ti.template(), n: ti.i32):
         rad: Current particle radii
         n: Number of active particles
     """
-    from config import (
-        JFA_DIRTY_POS_THRESHOLD, JFA_DIRTY_RAD_THRESHOLD,
-        JFA_DIRTY_HALO, JFA_TILE_SIZE
-    )
-    
     for i in range(n):
         # Check if particle has moved or radius changed significantly
         pos_delta = (pos[i] - pos_prev[i]).norm()
@@ -1124,7 +1122,6 @@ def run_jfa(pos, rad, active_n):
     
     # Step 6: Update FSC exponential moving average for temporal smoothing
     # This smooths out frame-to-frame noise when running with cadence > 1
-    from config import JFA_EMA_ALPHA
     update_fsc_ema(active_n, JFA_EMA_ALPHA)
     
     # OLD IMPLEMENTATION (commented out for reference):
